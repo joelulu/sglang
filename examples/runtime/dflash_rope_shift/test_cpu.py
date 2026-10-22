@@ -88,6 +88,27 @@ class PromptTranslationTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_diffusion_registry_inventory_schema(self):
+        # This group is imported even by text/VLM launch_server. Its registration
+        # loop unpacks exactly four fields per entry; an extra description broke
+        # server startup before any Target or Draft was loaded.
+        import ast
+
+        path = ROOT / "python/sglang/kernels/ops/diffusion/__init__.py"
+        tree = ast.parse(path.read_text())
+        inventory = next(
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "_SPECS"
+        )
+        self.assertGreater(len(inventory.elts), 0)
+        for entry in inventory.elts:
+            with self.subTest(line=entry.lineno):
+                self.assertIsInstance(entry, ast.Tuple)
+                self.assertEqual(len(entry.elts), 4)
+
     def test_dry_run_has_real_vlm_matrix_and_isolated_servers(self):
         import json
         import subprocess
