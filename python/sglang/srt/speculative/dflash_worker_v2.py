@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import os
@@ -58,6 +59,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_rope_shift import PromptRopeShift
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -390,6 +392,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         super().__init__()
 
         self.server_args = server_args
+        self._prompt_rope_shift = PromptRopeShift(
+            image_shift=envs.SGLANG_DFLASH_PROMPT_IMAGE_SHIFT.get(),
+            text_shift=envs.SGLANG_DFLASH_PROMPT_TEXT_SHIFT.get(),
+            text_keep_recent=envs.SGLANG_DFLASH_PROMPT_TEXT_KEEP_RECENT.get(),
+        )
+        self._rope_profile = envs.SGLANG_DFLASH_ROPE_PROFILE.get()
+        if self._rope_profile:
+            from sglang.srt.arg_groups.overrides import resolving_view
+
+            if not resolving_view(server_args).disable_overlap_schedule:
+                raise ValueError(
+                    "DFlash RoPE profiling requires --disable-overlap-schedule"
+                )
+            if torch.device(target_worker.device).type != "cuda":
+                raise ValueError("DFlash RoPE profiling requires CUDA events")
+        if self._prompt_rope_shift.enabled:
+            from sglang.srt.arg_groups.overrides import resolving_view
+
+            if not resolving_view(server_args).disable_radix_cache:
+                raise ValueError(
+                    "DFlash prompt RoPE shifts require --disable-radix-cache. "
+                    "Translated Draft KVs must not be reused across requests."
+                )
+            logger.warning(
+                "Experimental DFlash prompt RoPE shift: %s", self._prompt_rope_shift
+            )
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self._target_worker = target_worker
@@ -579,7 +607,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
+        self._use_fused_kv_materialize = (
+            is_cuda() or is_hip() or is_xpu()
+        ) and not envs.SGLANG_DFLASH_ROPE_FORCE_SEQUENTIAL_KV.get()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -2321,6 +2351,51 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _shift_prefill_context_positions(self, batch, positions):
+        """Change only the RoPE input, before fused/sequential KV paths split.
+
+        Use full request offsets rather than image token IDs: SGLang can hash
+        multimodal placeholders. Chunk boundaries are CPU scheduling metadata;
+        do not read GPU positions back or mutate the original position buffer.
+        """
+        if not self._prompt_rope_shift.enabled:
+            return positions
+        from sglang.srt.managers.schedule_batch import Modality
+
+        offsets = []
+        for req, start, length in zip(
+            batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
+        ):
+            spans = []
+            mm = req.multimodal_inputs
+            if mm is not None:
+                for item in mm.mm_items:
+                    if item.modality != Modality.IMAGE:
+                        raise ValueError(
+                            "DFlash prompt RoPE experiment supports images/text only"
+                        )
+                    if not item.offsets:
+                        raise ValueError(
+                            "Image offsets are required for DFlash prompt RoPE shifts"
+                        )
+                    spans.extend(item.offsets)
+            deltas, diagnostics = self._prompt_rope_shift.chunk_offsets(
+                len(req.origin_input_ids), start, length, spans
+            )
+            offsets.extend(deltas)
+            if get_parallel().tp_rank == 0:
+                logger.info(
+                    "DFLASH_PROMPT_ROPE %s",
+                    json.dumps({"rid": req.rid, **diagnostics}, sort_keys=True),
+                )
+        if len(offsets) != positions.numel():
+            raise ValueError(
+                "DFlash prompt RoPE offsets do not align with context positions"
+            )
+        return positions + torch.tensor(
+            offsets, dtype=positions.dtype, device=positions.device
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -2390,10 +2465,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             # The draft KV goes to the slots the target prefill just wrote.
+            context_rope_positions = self._shift_prefill_context_positions(
+                batch, positions
+            )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=self._draft_write_ids(kv_loc_plan),
-                positions=positions,
+                positions=context_rope_positions,
                 extend_lens=ctx_lens,
             )
 
@@ -2665,6 +2743,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     bs=bs, sampling_info=batch.sampling_info
                 )
 
+        rope_events = None
+        if self._rope_profile:
+            rope_events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            rope_events[0].record()
+
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
@@ -2794,6 +2877,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        if rope_events is not None:
+            rope_events[1].record()
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2854,12 +2939,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        if rope_events is not None:
+            rope_events[2].record()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
+        if rope_events is not None:
+            rope_events[3].record()
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
@@ -2973,6 +3062,26 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+
+        if rope_events is not None:
+            # Diagnostic runs only: synchronization and D2H perturb throughput.
+            rope_events[3].synchronize()
+            committed = commit_lens.cpu().tolist()
+            if get_parallel().tp_rank == 0:
+                logger.info(
+                    "DFLASH_ROPE_ROUND %s",
+                    json.dumps(
+                        {
+                            "rids": [req.rid for req in batch.reqs],
+                            "committed_tokens": committed,
+                            "block_size": int(self.block_size),
+                            "draft_ms": rope_events[0].elapsed_time(rope_events[1]),
+                            "verify_forward_ms": rope_events[2].elapsed_time(
+                                rope_events[3]
+                            ),
+                        }
+                    ),
+                )
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,
