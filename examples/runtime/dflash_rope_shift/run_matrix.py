@@ -63,19 +63,41 @@ def post_stream(url, payload, timeout):
     return last, elapsed, first
 
 
-def wait_ready(url, process, timeout):
-    deadline = time.monotonic() + timeout
+def log_tail(path, lines=1):
+    if path is None or not path.exists():
+        return ""
+    with path.open("rb") as file:
+        file.seek(0, 2)
+        file.seek(max(0, file.tell() - 8192))
+        return "\n".join(file.read().decode(errors="replace").splitlines()[-lines:])
+
+
+def wait_ready(url, process, timeout, log_path=None):
+    started = time.monotonic()
+    deadline = started + timeout
+    next_update = started
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("Server exited during startup; inspect its log")
+            raise RuntimeError(
+                f"Server exited during startup (exit={process.returncode}). "
+                f"Log: {log_path}\n{log_tail(log_path, 40)}"
+            )
+        if time.monotonic() >= next_update:
+            print(
+                f"[startup] waiting {time.monotonic() - started:.0f}s/{timeout}s "
+                f"pid={process.pid} log={log_path}\n  {log_tail(log_path)}",
+                flush=True,
+            )
+            next_update = time.monotonic() + 10
         try:
             with urllib.request.urlopen(url + "/health_generate", timeout=2) as reply:
                 if reply.status == 200:
+                    print(f"[startup] ready after {time.monotonic() - started:.1f}s", flush=True)
                     return
         except (urllib.error.URLError, TimeoutError):
             pass
         time.sleep(1)
-    raise TimeoutError("Server startup timed out; inspect its log")
+    raise TimeoutError(f"Server startup timed out. Log: {log_path}\n{log_tail(log_path, 40)}")
 
 
 def stop_server(process):
@@ -259,12 +281,14 @@ def main():
         print(json.dumps(plans, indent=2))
         return
 
+    print("[setup] Loading Target config and multimodal processor...", flush=True)
     from transformers import AutoConfig, AutoProcessor
 
     config = AutoConfig.from_pretrained(args.model)
     if "Qwen3_5ForConditionalGeneration" not in (config.architectures or []):
         raise ValueError("Use the full Qwen3.5-4B/9B VLM, not a text-only checkpoint")
     processor = AutoProcessor.from_pretrained(args.model)
+    print(f"[setup] Processor ready. Results: {args.output_dir}", flush=True)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     manifest = {
         "args": vars(args),
@@ -293,12 +317,14 @@ def main():
     rows = []
     mismatch = False
     with (args.output_dir / "results.jsonl").open("w") as output:
-        for name, command, overrides in plans:
+        for arm_index, (name, command, overrides) in enumerate(plans, 1):
+            log_path = args.output_dir / f"server_{name}.log"
+            print(f"\n[arm {arm_index}/{len(plans)}] {name}: starting server; log={log_path}", flush=True)
             env = os.environ.copy()
             env.update(overrides)
             env["SGLANG_DFLASH_ROPE_PROFILE"] = str(int(args.profile))
             env["SGLANG_DFLASH_ROPE_FORCE_SEQUENTIAL_KV"] = str(int(args.sequential_kv))
-            with (args.output_dir / f"server_{name}.log").open("w") as log:
+            with log_path.open("w") as log:
                 process = subprocess.Popen(
                     command,
                     env=env,
@@ -307,11 +333,19 @@ def main():
                     start_new_session=True,
                 )
                 try:
-                    wait_ready(url, process, args.startup_timeout)
+                    wait_ready(url, process, args.startup_timeout, log_path)
+                    case_index = 0
+                    total_cases = len(samples) * len(args.image_max_edges) * len(args.context_tokens)
                     for sample in samples:
                         for edge in args.image_max_edges:
                             image, image_hash = image_data(sample["image"], edge)
                             for count in args.context_tokens:
+                                case_index += 1
+                                print(
+                                    f"[{name} {case_index}/{total_cases}] id={sample['id']} "
+                                    f"context={count} image_edge={edge}: preparing input",
+                                    flush=True,
+                                )
                                 context, actual_count = filler_text(
                                     processor.tokenizer, filler, count
                                 )
@@ -341,6 +375,7 @@ def main():
                                     },
                                 }
                                 # Warm each shape separately; no prefix reuse. Excluded from results.
+                                print(f"[{name} {case_index}/{total_cases}] warmup (8 tokens)...", flush=True)
                                 post_stream(
                                     url,
                                     {
@@ -353,6 +388,7 @@ def main():
                                     },
                                     args.request_timeout,
                                 )
+                                print(f"[{name} {case_index}/{total_cases}] measuring (max {args.max_new_tokens} tokens)...", flush=True)
                                 response, elapsed, ttft = post_stream(
                                     url, payload, args.request_timeout
                                 )
@@ -429,6 +465,7 @@ def main():
                                 output.flush()
                                 print(json.dumps(row), flush=True)
                 finally:
+                    print(f"[{name}] stopping server...", flush=True)
                     stop_server(process)
             measured_rids = {row["rid"] for row in rows if row["arm"] == name}
             for marker, stem in (
@@ -452,6 +489,7 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    print(f"[done] {len(rows)} results saved to {args.output_dir / 'results.csv'}", flush=True)
     if mismatch:
         raise SystemExit(
             "Output mismatch detected. Inspect results before interpreting speedups."
