@@ -29,6 +29,25 @@ runner = load_module(
 
 
 class PromptTranslationTests(unittest.TestCase):
+    def test_nearest_is_fixed_and_preserves_visual_span(self):
+        config = PromptRopeShift(image_nearest=True)
+        self.assertTrue(config.enabled)
+        full, info = config.chunk_offsets(100, 0, 110, [(4, 23)])
+        self.assertEqual(info["effective_image_shift"], 76)
+        self.assertEqual(info["image_end_distance_after"], 1)
+        self.assertEqual([p + full[p] for p in range(4, 24)], list(range(80, 100)))
+        self.assertEqual(full[100:], [0] * 10)
+        chunks = []
+        for start, size in [(0, 13), (13, 87), (100, 10)]:
+            chunk, _ = config.chunk_offsets(100, start, size, [(4, 23)])
+            chunks.extend(chunk)
+        self.assertEqual(chunks, full)
+
+    def test_nearest_without_image_is_noop(self):
+        offsets, info = PromptRopeShift(image_nearest=True).chunk_offsets(30, 0, 30, [])
+        self.assertEqual(offsets, [0] * 30)
+        self.assertIsNone(info["image_end_distance_after"])
+
     def test_zero_identity(self):
         config = PromptRopeShift()
         self.assertFalse(config.enabled)
@@ -88,6 +107,44 @@ class PromptTranslationTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_image_sweep_has_one_control_and_no_text_intervention(self):
+        plans = runner.arms(
+            128, 128, False, ["0", "128", "0128", "1024", "4096", "nearest"]
+        )
+        self.assertEqual(
+            [name for name, _, _ in plans],
+            ["baseline", "image_128", "image_1024", "image_4096", "image_nearest"],
+        )
+        self.assertTrue(all(text == 0 for _, _, text in plans))
+        with self.assertRaises(ValueError):
+            runner.arms(128, 128, False, ["invalid"])
+
+    def test_shift_summary_aggregates_chunks_and_excludes_warmup(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            entries = [
+                {"rid": "case-warmup", "changed_tokens": 100},
+                {"rid": "case", "changed_tokens": 4, "effective_image_shift": 128},
+                {"rid": "case", "changed_tokens": 6, "effective_image_shift": 128},
+            ]
+            path.write_text(
+                "\n".join("[INFO] DFLASH_PROMPT_ROPE " + json.dumps(x) for x in entries)
+            )
+            summary = runner.shift_summary(path, "case")
+            self.assertEqual(summary["changed_tokens"], 10)
+            self.assertEqual(summary["effective_image_shift"], 128)
+            with self.assertRaises(RuntimeError):
+                runner.shift_summary(path, "missing")
+            entries[-1]["effective_image_shift"] = 127
+            path.write_text(
+                "\n".join("DFLASH_PROMPT_ROPE " + json.dumps(x) for x in entries)
+            )
+            with self.assertRaises(RuntimeError):
+                runner.shift_summary(path, "case")
+
     def test_diffusion_registry_inventory_schema(self):
         # This group is imported even by text/VLM launch_server. Its registration
         # loop unpacks exactly four fields per entry; an extra description broke
@@ -149,6 +206,24 @@ class StreamTests(unittest.TestCase):
                     "--speculative-algorithm" in argv, name != "target_only"
                 )
             self.assertFalse((directory / "out").exists())
+            sweep = json.loads(
+                subprocess.check_output(
+                    command
+                    + ["--image-shift-sweep", "0", "128", "1024", "4096", "nearest"],
+                    text=True,
+                )
+            )
+            self.assertEqual(len(sweep), 6)
+            for name, _, environment in sweep:
+                self.assertEqual(environment["SGLANG_DFLASH_PROMPT_TEXT_SHIFT"], "0")
+                self.assertEqual(
+                    environment["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"],
+                    "1" if name == "image_nearest" else "0",
+                )
+                if name == "image_4096":
+                    self.assertEqual(
+                        environment["SGLANG_DFLASH_PROMPT_IMAGE_SHIFT"], "4096"
+                    )
 
     def test_native_stream_keeps_final_cumulative_ids(self):
         import io

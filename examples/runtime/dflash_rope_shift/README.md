@@ -184,3 +184,61 @@ positioning; text-only improvements indicate a broader text-position effect;
 both exceeding single-modality arms suggests complementarity. Improvements in
 acceptance must also improve unprofiled end-to-end speed. These experiments
 alone do not establish RoPE training-range mismatch or improved visual grounding.
+
+## Image-only translation sweep (next diagnostic)
+
+Keep the same image/question, use one fixed 16K filler context, and vary only
+image translation. No training is involved. Text and generated-token positions
+remain unshifted. The optional Target-only arm is a correctness reference.
+
+```bash
+export CUDA_VISIBLE_DEVICES=6
+export NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="$NO_PROXY"
+
+python examples/runtime/dflash_rope_shift/run_matrix.py \
+  --model "$HOME/LMM/lmm_model/Qwen3.5-9B" \
+  --draft "$HOME/LMM/lmm_model/Qwen3.5-9B-DFlash" \
+  --samples smoke_rope/samples.jsonl \
+  --output-dir "smoke_rope/image_sweep_$(date +%Y%m%d_%H%M%S)" \
+  --port 31001 \
+  --include-target-only \
+  --context-tokens 16384 \
+  --filler-file smoke_rope/neutral_context.txt \
+  --image-shift-sweep 0 128 1024 4096 nearest \
+  --max-new-tokens 256 \
+  --server-args-json '["--mem-fraction-static","0.7"]'
+```
+
+Keep the previously configured CUDA 13 compatibility environment active. The
+example selects physical GPU 6, a single GPU. Add `--dry-run` to inspect launch
+settings without starting services. The samples and filler files must exist.
+
+`--image-shift-sweep` replaces the four-arm factorial matrix; its values are
+integers or `nearest`. It always includes exactly one zero-shift baseline and
+deduplicates repeated values. It ignores `--image-shift` and `--text-shift`.
+This example runs **6 arms** (Target-only, baseline, image_128, image_1024,
+image_4096, image_nearest), so one sample/length gives six measured records.
+
+`nearest` chooses a fixed per-request delta that places the last image Key at
+`prompt_length - 1`, immediately before the first Draft Block. Image internal
+spacing is preserved, so a 1024-token image still spans 1024 positions. Later
+Blocks move away as generation progresses: nearest is not a moving mapping.
+With multiple images the entire visual group shares one translation, placing
+the final visual Key next to the first Block. This is not position compression.
+Its environment switch is `SGLANG_DFLASH_PROMPT_IMAGE_NEAREST=1`; it takes
+precedence over the fixed image shift. The runner resets it for every other arm.
+
+CSV/JSONL results now include requested translations, `image_shift_mode`,
+`effective_image_shift`, `effective_text_shift`, `eligible_text_tokens`,
+`changed_tokens` (summed across measured Prefill chunks), and
+`image_end_distance_before/after`. Distances refer to the first Block's first
+Query. Baseline/Target-only have zero shifts; unmeasured eligibility/distance
+fields are blank. Missing or inconsistent intervention diagnostics fail the run
+rather than silently treating an unconfirmed mapping as effective.
+
+Compare verification rounds and acceptance length against baseline on the same
+input first. The sweep uses deterministic decoding and one timing measurement
+per case; it is a mechanism probe, not a statistically established speedup or
+a held-out result. If a favorable offset emerges, freeze it and evaluate it on
+new images/questions before drawing a general conclusion.

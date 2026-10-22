@@ -1496,6 +1496,7 @@ class Envs:
     # Zero/zero leaves the original runtime path untouched. Requires no radix
     # reuse; see examples/runtime/dflash_rope_shift/README.md.
     SGLANG_DFLASH_PROMPT_IMAGE_SHIFT = EnvInt(0)
+    SGLANG_DFLASH_PROMPT_IMAGE_NEAREST = EnvBool(False)
     SGLANG_DFLASH_PROMPT_TEXT_SHIFT = EnvInt(0)
     SGLANG_DFLASH_PROMPT_TEXT_KEEP_RECENT = EnvInt(256)
     SGLANG_DFLASH_ROPE_PROFILE = EnvBool(False)

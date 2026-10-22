@@ -14,6 +14,7 @@ class PromptRopeShift:
     image_shift: int = 0
     text_shift: int = 0
     text_keep_recent: int = 256
+    image_nearest: bool = False
 
     def __post_init__(self):
         if self.text_keep_recent < 0:
@@ -21,7 +22,7 @@ class PromptRopeShift:
 
     @property
     def enabled(self):
-        return self.image_shift != 0 or self.text_shift != 0
+        return self.image_nearest or self.image_shift != 0 or self.text_shift != 0
 
     def chunk_offsets(self, prompt_len, start, length, image_spans):
         """Return (offsets, diagnostics); image span endpoints are inclusive.
@@ -52,7 +53,12 @@ class PromptRopeShift:
                 return 0
             return min(max(requested, -positions[0]), prompt_len - 1 - positions[-1])
 
-        image_delta = bounded_shift(self.image_shift, image_positions)
+        # Nearest puts the last visual Key immediately before the *first*
+        # Draft Block. It is fixed for the whole request and preserves image
+        # internal spacing, rather than pinning all image tokens to one point.
+        image_delta = bounded_shift(
+            prompt_len if self.image_nearest else self.image_shift, image_positions
+        )
         text_delta = bounded_shift(self.text_shift, text_positions)
         offsets = []
         for p in range(start, start + length):
@@ -69,9 +75,16 @@ class PromptRopeShift:
             "image_tokens": len(image_positions),
             "eligible_text_tokens": len(text_positions),
             "requested_image_shift": self.image_shift,
+            "image_shift_mode": "nearest" if self.image_nearest else "fixed",
             "requested_text_shift": self.text_shift,
             "effective_image_shift": image_delta,
             "effective_text_shift": text_delta,
+            "image_end_distance_before": prompt_len - image_positions[-1]
+            if image_positions
+            else None,
+            "image_end_distance_after": prompt_len - image_positions[-1] - image_delta
+            if image_positions
+            else None,
             "text_keep_recent": self.text_keep_recent,
             "chunk_start": start,
             "chunk_tokens": length,

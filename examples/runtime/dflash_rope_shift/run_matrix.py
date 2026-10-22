@@ -24,14 +24,53 @@ ENV_KEYS = (
 )
 
 
-def arms(image_shift, text_shift, target_only):
-    result = [
-        ("baseline", 0, 0),
-        ("image", image_shift, 0),
-        ("text", 0, text_shift),
-        ("both", image_shift, text_shift),
-    ]
+def arms(image_shift, text_shift, target_only, image_shift_sweep=None):
+    if image_shift_sweep is None:
+        result = [
+            ("baseline", 0, 0),
+            ("image", image_shift, 0),
+            ("text", 0, text_shift),
+            ("both", image_shift, text_shift),
+        ]
+    else:
+        result = [("baseline", 0, 0)]
+        seen = {0}
+        for value in image_shift_sweep:
+            try:
+                delta = "nearest" if value == "nearest" else int(value)
+            except ValueError:
+                raise ValueError(
+                    "Image sweep values must be integers or 'nearest'"
+                ) from None
+            if delta not in seen:
+                result.append((f"image_{delta}", delta, 0))
+                seen.add(delta)
     return ([("target_only", 0, 0)] if target_only else []) + result
+
+
+def shift_summary(log_path, rid):
+    """Read measured-request diagnostics, summing changed counts across chunks."""
+    chunks = []
+    with log_path.open() as file:
+        for line in file:
+            if "DFLASH_PROMPT_ROPE " in line:
+                entry = json.loads(line.split("DFLASH_PROMPT_ROPE ", 1)[1])
+                if entry.get("rid") == rid:
+                    chunks.append(entry)
+    if not chunks:
+        raise RuntimeError(f"No confirmed RoPE mapping for {rid}; inspect {log_path}")
+    keys = (
+        "effective_image_shift",
+        "effective_text_shift",
+        "eligible_text_tokens",
+        "image_end_distance_before",
+        "image_end_distance_after",
+    )
+    summary = {key: chunks[0].get(key) for key in keys}
+    if any(any(entry.get(key) != summary[key] for key in keys) for entry in chunks):
+        raise RuntimeError(f"Inconsistent full-prompt mapping across chunks for {rid}")
+    summary["changed_tokens"] = sum(entry["changed_tokens"] for entry in chunks)
+    return summary
 
 
 def post_stream(url, payload, timeout):
@@ -92,12 +131,17 @@ def wait_ready(url, process, timeout, log_path=None):
         try:
             with urllib.request.urlopen(url + "/health_generate", timeout=2) as reply:
                 if reply.status == 200:
-                    print(f"[startup] ready after {time.monotonic() - started:.1f}s", flush=True)
+                    print(
+                        f"[startup] ready after {time.monotonic() - started:.1f}s",
+                        flush=True,
+                    )
                     return
         except (urllib.error.URLError, TimeoutError):
             pass
         time.sleep(1)
-    raise TimeoutError(f"Server startup timed out. Log: {log_path}\n{log_tail(log_path, 40)}")
+    raise TimeoutError(
+        f"Server startup timed out. Log: {log_path}\n{log_tail(log_path, 40)}"
+    )
 
 
 def stop_server(process):
@@ -168,6 +212,12 @@ def parse_args():
     parser.add_argument("--samples", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--image-shift", type=int, default=128)
+    parser.add_argument(
+        "--image-shift-sweep",
+        nargs="+",
+        metavar="SHIFT",
+        help="Run baseline plus image-only translations, e.g. 0 128 1024 4096 nearest; ignores --image-shift/--text-shift",
+    )
     parser.add_argument("--text-shift", type=int, default=128)
     parser.add_argument("--text-keep-recent", type=int, default=256)
     parser.add_argument("--context-tokens", nargs="+", type=int, default=[0])
@@ -240,7 +290,10 @@ def main():
         )
     plans = []
     for name, image_shift, text_shift in arms(
-        args.image_shift, args.text_shift, args.include_target_only
+        args.image_shift,
+        args.text_shift,
+        args.include_target_only,
+        args.image_shift_sweep,
     ):
         command = [
             sys.executable,
@@ -272,10 +325,22 @@ def main():
                 dict(
                     zip(
                         ENV_KEYS,
-                        map(str, (image_shift, text_shift, args.text_keep_recent)),
+                        map(
+                            str,
+                            (
+                                0 if image_shift == "nearest" else image_shift,
+                                text_shift,
+                                args.text_keep_recent,
+                            ),
+                        ),
                     )
                 ),
             )
+        )
+        # Explicitly reset this for every arm, including baseline, so an inherited
+        # environment cannot silently enable nearest placement in control runs.
+        plans[-1][2]["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"] = str(
+            int(image_shift == "nearest")
         )
     if args.dry_run:
         print(json.dumps(plans, indent=2))
@@ -319,7 +384,10 @@ def main():
     with (args.output_dir / "results.jsonl").open("w") as output:
         for arm_index, (name, command, overrides) in enumerate(plans, 1):
             log_path = args.output_dir / f"server_{name}.log"
-            print(f"\n[arm {arm_index}/{len(plans)}] {name}: starting server; log={log_path}", flush=True)
+            print(
+                f"\n[arm {arm_index}/{len(plans)}] {name}: starting server; log={log_path}",
+                flush=True,
+            )
             env = os.environ.copy()
             env.update(overrides)
             env["SGLANG_DFLASH_ROPE_PROFILE"] = str(int(args.profile))
@@ -335,7 +403,11 @@ def main():
                 try:
                     wait_ready(url, process, args.startup_timeout, log_path)
                     case_index = 0
-                    total_cases = len(samples) * len(args.image_max_edges) * len(args.context_tokens)
+                    total_cases = (
+                        len(samples)
+                        * len(args.image_max_edges)
+                        * len(args.context_tokens)
+                    )
                     for sample in samples:
                         for edge in args.image_max_edges:
                             image, image_hash = image_data(sample["image"], edge)
@@ -375,7 +447,10 @@ def main():
                                     },
                                 }
                                 # Warm each shape separately; no prefix reuse. Excluded from results.
-                                print(f"[{name} {case_index}/{total_cases}] warmup (8 tokens)...", flush=True)
+                                print(
+                                    f"[{name} {case_index}/{total_cases}] warmup (8 tokens)...",
+                                    flush=True,
+                                )
                                 post_stream(
                                     url,
                                     {
@@ -388,7 +463,10 @@ def main():
                                     },
                                     args.request_timeout,
                                 )
-                                print(f"[{name} {case_index}/{total_cases}] measuring (max {args.max_new_tokens} tokens)...", flush=True)
+                                print(
+                                    f"[{name} {case_index}/{total_cases}] measuring (max {args.max_new_tokens} tokens)...",
+                                    flush=True,
+                                )
                                 response, elapsed, ttft = post_stream(
                                     url, payload, args.request_timeout
                                 )
@@ -427,6 +505,12 @@ def main():
                                     "id": sample["id"],
                                     "rid": rid,
                                     "profile": args.profile,
+                                    "requested_image_shift": overrides[ENV_KEYS[0]],
+                                    "requested_text_shift": overrides[ENV_KEYS[1]],
+                                    "image_shift_mode": "nearest"
+                                    if overrides["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"]
+                                    == "1"
+                                    else "fixed",
                                     "context_tokens_requested": count,
                                     "context_tokens_actual": actual_count,
                                     "image_max_edge": edge,
@@ -451,6 +535,24 @@ def main():
                                     "matches_baseline": same,
                                     "matches_target": same_target,
                                 }
+                                intervention = (
+                                    int(overrides[ENV_KEYS[0]]) != 0
+                                    or int(overrides[ENV_KEYS[1]]) != 0
+                                    or overrides["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"]
+                                    == "1"
+                                )
+                                row.update(
+                                    shift_summary(log_path, rid)
+                                    if intervention
+                                    else {
+                                        "effective_image_shift": 0,
+                                        "effective_text_shift": 0,
+                                        "eligible_text_tokens": None,
+                                        "image_end_distance_before": None,
+                                        "image_end_distance_after": None,
+                                        "changed_tokens": 0,
+                                    }
+                                )
                                 rows.append(row)
                                 output.write(
                                     json.dumps(
@@ -489,7 +591,10 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    print(f"[done] {len(rows)} results saved to {args.output_dir / 'results.csv'}", flush=True)
+    print(
+        f"[done] {len(rows)} results saved to {args.output_dir / 'results.csv'}",
+        flush=True,
+    )
     if mismatch:
         raise SystemExit(
             "Output mismatch detected. Inspect results before interpreting speedups."

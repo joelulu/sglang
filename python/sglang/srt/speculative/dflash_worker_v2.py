@@ -394,6 +394,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.server_args = server_args
         self._prompt_rope_shift = PromptRopeShift(
             image_shift=envs.SGLANG_DFLASH_PROMPT_IMAGE_SHIFT.get(),
+            image_nearest=envs.SGLANG_DFLASH_PROMPT_IMAGE_NEAREST.get(),
             text_shift=envs.SGLANG_DFLASH_PROMPT_TEXT_SHIFT.get(),
             text_keep_recent=envs.SGLANG_DFLASH_PROMPT_TEXT_KEEP_RECENT.get(),
         )
