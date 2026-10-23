@@ -26,6 +26,9 @@ PromptRopeShift = shift_module.PromptRopeShift
 runner = load_module(
     "dflash_rope_matrix_cpu_test", Path(__file__).with_name("run_matrix.py")
 )
+summary_module = load_module(
+    "dflash_rope_summary_cpu_test", Path(__file__).with_name("summarize_results.py")
+)
 
 
 class PromptTranslationTests(unittest.TestCase):
@@ -171,6 +174,72 @@ class PromptTranslationTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_prompt_alias_preserves_questions_and_blank_answers(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            (directory / "image.jpg").touch()
+            path = directory / "samples.jsonl"
+            sample = {
+                "id": "a",
+                "image": "image.jpg",
+                "prompt": "what brand of phone?",
+                "answer": "",
+            }
+            path.write_text(json.dumps(sample))
+            loaded = runner.load_samples(path)
+            self.assertEqual(loaded[0]["question"], sample["prompt"])
+            self.assertEqual(loaded[0]["answer"], "")
+            sample["question"] = "different question"
+            path.write_text(json.dumps(sample))
+            with self.assertRaisesRegex(ValueError, "conflicting"):
+                runner.load_samples(path)
+
+    def test_summary_pools_rounds_and_reports_paired_wins(self):
+        rows = []
+        for arm, counts in [("baseline", [2, 8]), ("both_mask", [3, 5])]:
+            for i, rounds in enumerate(counts):
+                rows.append(
+                    {
+                        "id": str(i),
+                        "context_tokens_requested": 4096,
+                        "image_max_edge": 0,
+                        "arm": arm,
+                        "image_sha256": "shared-image",
+                        "completion_tokens": 8,
+                        "spec_verify_ct": rounds,
+                        "matches_baseline": True,
+                        "matches_target": None,
+                        "fixed_output_budget_met": True,
+                        "timing_diagnostic_only": True,
+                    }
+                )
+        summaries = {r["arm"]: r for r in summary_module.summarize(rows)}
+        row = summaries["both_mask"]
+        self.assertEqual(row["samples"], 2)
+        self.assertEqual(row["unique_image_hashes"], 1)
+        self.assertEqual(row["pooled_accept_length"], 2)
+        self.assertAlmostEqual(row["pooled_accept_length_change_pct"], 25)
+        self.assertAlmostEqual(
+            row["paired_accept_change_mean_pct"], 100 * ((2 / 3 - 1) + (8 / 5 - 1)) / 2
+        )
+        self.assertEqual((row["win_count"], row["loss_count"]), (1, 1))
+        self.assertEqual(row["target_comparisons"], 0)
+        self.assertEqual(row["fixed_output_budget_met_count"], 2)
+        # CSV serialization must give the same summaries as in-memory rows.
+        string_rows = [
+            {k: str(v) if v is not None else "" for k, v in r.items()} for r in rows
+        ]
+        self.assertEqual(
+            summary_module.summarize(string_rows), summary_module.summarize(rows)
+        )
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            summary_module.summarize(rows + [rows[0]])
+        with self.assertRaisesRegex(ValueError, "Missing paired baseline"):
+            summary_module.summarize(rows[2:])
+
     def test_backend_validation_runs_after_deferred_backend_initialization(self):
         # Execute the real lifecycle methods with a worker whose ModelRunner has
         # no backend until init_attention_backends(). No GPU imports required.

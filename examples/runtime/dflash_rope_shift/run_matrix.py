@@ -274,9 +274,20 @@ def load_samples(path):
             raise ValueError(f"Duplicate sample id: {sample_id}")
         seen.add(sample_id)
         image = (path.parent / sample["image"]).resolve()
-        if not image.is_file() or not sample.get("question"):
+        question = sample.get("question") or sample.get("prompt")
+        if (
+            sample.get("question")
+            and sample.get("prompt")
+            and sample["question"] != sample["prompt"]
+        ):
+            raise ValueError(
+                f"Sample {sample_id} has conflicting question/prompt fields"
+            )
+        if not image.is_file() or not isinstance(question, str) or not question.strip():
             raise ValueError(f"Sample {sample_id} needs a local image and question")
-        samples.append({**sample, "id": sample_id, "image": image})
+        samples.append(
+            {**sample, "id": sample_id, "image": image, "question": question}
+        )
     if not samples:
         raise ValueError("Samples file is empty")
     return samples
@@ -334,6 +345,16 @@ def parse_args():
         help="Exercise the non-fused Context KV path",
     )
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Continue to the output budget after EOS for a fixed-length acceptance probe; not natural VQA answer evaluation",
+    )
+    parser.add_argument(
+        "--allow-output-mismatch",
+        action="store_true",
+        help="Keep output identity flags but do not fail the completed acceptance-only matrix on mismatches",
+    )
     parser.add_argument("--port", type=int, default=31000)
     parser.add_argument("--startup-timeout", type=int, default=900)
     parser.add_argument("--request-timeout", type=int, default=600)
@@ -590,6 +611,7 @@ def main():
                                     "sampling_params": {
                                         "temperature": 0,
                                         "max_new_tokens": args.max_new_tokens,
+                                        "ignore_eos": args.ignore_eos,
                                     },
                                 }
                                 # Warm each shape separately; no prefix reuse. Excluded from results.
@@ -605,6 +627,7 @@ def main():
                                         "sampling_params": {
                                             "temperature": 0,
                                             "max_new_tokens": 8,
+                                            "ignore_eos": args.ignore_eos,
                                         },
                                     },
                                     args.request_timeout,
@@ -675,6 +698,10 @@ def main():
                                     "prompt_tokens": meta.get("prompt_tokens"),
                                     "image_tokens": meta["image_tokens"],
                                     "completion_tokens": tokens,
+                                    "max_new_tokens": args.max_new_tokens,
+                                    "ignore_eos": args.ignore_eos,
+                                    "fixed_output_budget_met": tokens
+                                    == args.max_new_tokens,
                                     "spec_accept_length": meta.get(
                                         "spec_accept_length"
                                     ),
@@ -785,14 +812,22 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    from summarize_results import summarize, write_summary
+
+    write_summary(summarize(rows), args.output_dir / "summary.csv")
     print(
         f"[done] {len(rows)} results saved to {args.output_dir / 'results.csv'}",
         flush=True,
     )
+    print(
+        f"[done] Acceptance comparison: {args.output_dir / 'summary.csv'}", flush=True
+    )
     if mismatch:
-        raise SystemExit(
-            "Output mismatch detected. Inspect results before interpreting speedups."
-        )
+        message = "Output mismatch detected; identity flags are retained in results."
+        if args.allow_output_mismatch:
+            print(f"[acceptance-only] {message}", flush=True)
+        else:
+            raise SystemExit(message)
 
 
 if __name__ == "__main__":

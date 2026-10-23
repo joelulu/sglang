@@ -409,3 +409,71 @@ timings remain unsuitable for claiming production speedups.
 
 Additional environment switches, explicitly reset per arm:
 `SGLANG_DFLASH_PROMPT_TEXT_NEAREST=1` and `SGLANG_DFLASH_TEXT_KV_MASK=1`.
+
+## TextVQA acceptance-only run
+
+`load_samples` accepts either `question` or `prompt`. If both are supplied they
+must agree. Questions are passed through unchanged; blank reference answers
+are allowed. `textvqa_11.jsonl` contains the supplied 11 questions on 6 images,
+using the original server-local image paths. Those images are not in this repo.
+
+For this experiment omit `--include-target-only`: every arm remains DFlash,
+and Target verification within each arm supplies acceptance decisions. Use
+`--allow-output-mismatch` to retain all identity flags without failing the
+completed matrix. This does not assert distributional correctness; it scopes
+the run to the requested acceptance-only diagnostic.
+
+`--max-new-tokens 256` alone is only an upper bound: VQA answers often end much
+earlier. Add `--ignore-eos` for a fixed 256-token probe. This continues after
+natural EOS and can produce repetitive or otherwise unnatural continuations;
+interpret its acceptance as the fixed-length probe, not VQA answer accuracy.
+Neither this flag nor the runner adds an explanation request to the question.
+CSV records `ignore_eos`, `max_new_tokens`, actual `completion_tokens`, and
+`fixed_output_budget_met` so unexpectedly short generations are visible.
+Leave `--ignore-eos` off for a separate natural-answer experiment.
+
+```bash
+git pull --ff-only origin research/vlm-dflash-rope-shift
+python examples/runtime/dflash_rope_shift/test_cpu.py
+
+CUDA_VISIBLE_DEVICES=7 python examples/runtime/dflash_rope_shift/run_matrix.py \
+  --model "$HOME/LMM/lmm_model/Qwen3.5-9B" \
+  --draft "$HOME/LMM/lmm_model/Qwen3.5-9B-DFlash" \
+  --samples examples/runtime/dflash_rope_shift/textvqa_11.jsonl \
+  --output-dir "smoke_rope/textvqa_diag_$(date +%Y%m%d_%H%M%S)" \
+  --port 31001 \
+  --modality-kv-diagnostic \
+  --context-tokens 0 1024 4096 8192 16384 32768 \
+  --text-keep-recent 256 \
+  --filler-file smoke_rope/neutral_context.txt \
+  --max-new-tokens 256 \
+  --ignore-eos \
+  --allow-output-mismatch \
+  --server-args-json '["--mem-fraction-static","0.7"]'
+```
+
+Keep the established virtual environment, CUDA compatibility variables and
+localhost proxy exclusions active. This gives **462 formal measurements**
+(11 questions x 6 lengths x 7 DFlash arms), with 8-token warmups excluded.
+For another prepared JSONL, replace only `--samples`. Results remain per-question
+in `results.csv`/`results.jsonl` and per-round in `rounds_*.jsonl`.
+
+The runner also writes `summary.csv`, grouping by context length, image size and
+arm. Each of its 42 rows summarizes 11 questions:
+
+* `pooled_accept_length`: total completion tokens / total verification calls.
+* `pooled_accept_length_change_pct`: that ratio relative to paired baseline.
+* `paired_accept_change_mean_pct`: mean of per-question relative changes.
+* `win_count`, `tie_count`, `loss_count`: question-level comparisons to baseline.
+* Sample count, unique-image hashes, output-length range, fixed-budget counts
+  and output identity mismatch counts.
+
+Questions sharing one image are not independent images. This small set supports
+an initial TextVQA mechanism probe; it does not represent overall TextVQA
+accuracy. Diagnostic throughput still must not be treated as serving speedup.
+
+You can summarize an existing CSV locally without model loading:
+
+```bash
+python examples/runtime/dflash_rope_shift/summarize_results.py RUN/results.csv
+```
