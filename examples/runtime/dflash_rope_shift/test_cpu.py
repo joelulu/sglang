@@ -127,6 +127,80 @@ class PromptTranslationTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_backend_validation_runs_after_deferred_backend_initialization(self):
+        # Execute the real lifecycle methods with a worker whose ModelRunner has
+        # no backend until init_attention_backends(). No GPU imports required.
+        import ast
+        from contextlib import nullcontext
+        from types import ModuleType, SimpleNamespace
+        from unittest.mock import patch
+
+        source = ROOT / "python/sglang/srt/speculative/dflash_worker_v2.py"
+        tree = ast.parse(source.read_text())
+        worker_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_validate_image_diagnostic_backend"
+                for item in node.body
+            )
+        )
+        methods = {
+            node.name: node
+            for node in worker_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        constructor_backend_reads = [
+            node
+            for node in ast.walk(methods["__init__"])
+            if isinstance(node, ast.Attribute) and node.attr == "attn_backend"
+        ]
+        self.assertEqual(constructor_backend_reads, [])
+        module = ast.Module(
+            body=[
+                methods["init_attention_backends"],
+                methods["_validate_image_diagnostic_backend"],
+            ],
+            type_ignores=[],
+        )
+        namespace = {
+            "draft_pp_context": nullcontext,
+            "draft_tp_context": lambda _: nullcontext(),
+            "mambaish_config": lambda _: None,
+        }
+        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+
+        class Backend:
+            pass
+
+        flashinfer = ModuleType("sglang.srt.layers.attention.flashinfer_backend")
+        flashinfer.FlashInferAttnBackend = Backend
+        runner = SimpleNamespace()  # Reproduce the missing attribute at construction.
+        worker = SimpleNamespace(
+            _rope_diagnostic=True,
+            draft_owns_attention=False,
+            draft_model_runner=runner,
+            model_runner=SimpleNamespace(model_config=None),
+        )
+        worker._draft_worker = SimpleNamespace(
+            init_attention_backends=lambda: setattr(runner, "attn_backend", Backend())
+        )
+        worker._validate_image_diagnostic_backend = lambda: namespace[
+            "_validate_image_diagnostic_backend"
+        ](worker)
+        with patch.dict(sys.modules, {flashinfer.__name__: flashinfer}):
+            self.assertFalse(hasattr(runner, "attn_backend"))
+            namespace["init_attention_backends"](worker)
+            self.assertIsInstance(runner.attn_backend, Backend)
+            runner.attn_backend = object()
+            with self.assertRaisesRegex(ValueError, "FlashInfer"):
+                worker._validate_image_diagnostic_backend()
+            worker._rope_diagnostic = False
+            del runner.attn_backend
+            worker._validate_image_diagnostic_backend()
+
     def test_mask_confirmation_checks_all_rounds_and_excludes_warmup(self):
         import json
         import tempfile

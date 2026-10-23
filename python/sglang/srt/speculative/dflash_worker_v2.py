@@ -487,17 +487,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         if self._rope_diagnostic:
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                FlashInferAttnBackend,
-            )
             from sglang.srt.layers.radix_attention import AttentionType
 
-            if self.use_compact_draft_cache or not isinstance(
-                self.draft_model_runner.attn_backend, FlashInferAttnBackend
-            ):
-                raise ValueError(
-                    "Image diagnostic requires noncompact Draft KV and FlashInfer Draft attention"
-                )
+            if self.use_compact_draft_cache:
+                raise ValueError("Image diagnostic requires noncompact Draft KV")
             for layer in self.draft_model.layers:
                 attn = layer.self_attn
                 if (
@@ -752,12 +745,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_owns_attention),
         ):
             self._draft_worker.init_attention_backends()
+            self._validate_image_diagnostic_backend()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )
+
+    def _validate_image_diagnostic_backend(self):
+        # ModelRunner is built with deferred backend initialization. Inspect the
+        # live backend only after TpModelWorker.init_attention_backends creates it.
+        if self._rope_diagnostic:
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferAttnBackend,
+            )
+
+            if not isinstance(
+                self.draft_model_runner.attn_backend, FlashInferAttnBackend
+            ):
+                raise ValueError("Image diagnostic requires FlashInfer Draft attention")
 
     def init_cuda_graphs(self):
         with (
