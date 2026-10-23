@@ -24,8 +24,24 @@ ENV_KEYS = (
 )
 
 
-def arms(image_shift, text_shift, target_only, image_shift_sweep=None):
-    if image_shift_sweep is None:
+def arms(
+    image_shift,
+    text_shift,
+    target_only,
+    image_shift_sweep=None,
+    image_kv_diagnostic=False,
+):
+    if image_kv_diagnostic:
+        if image_shift_sweep is not None:
+            raise ValueError(
+                "Choose image KV diagnostic or image shift sweep, not both"
+            )
+        result = [
+            ("baseline", 0, 0),
+            ("image_nearest", "nearest", 0),
+            ("image_mask", 0, 0),
+        ]
+    elif image_shift_sweep is None:
         result = [
             ("baseline", 0, 0),
             ("image", image_shift, 0),
@@ -71,6 +87,20 @@ def shift_summary(log_path, rid):
         raise RuntimeError(f"Inconsistent full-prompt mapping across chunks for {rid}")
     summary["changed_tokens"] = sum(entry["changed_tokens"] for entry in chunks)
     return summary
+
+
+def mask_summary(log_path, rid, expected_image_tokens, masked):
+    """Require runtime confirmation, including every measured Draft round."""
+    entries = []
+    for line in log_path.read_text().splitlines():
+        if "DFLASH_IMAGE_MASK " in line:
+            entry = json.loads(line.split("DFLASH_IMAGE_MASK ", 1)[1])
+            if entry.get("rid") == rid:
+                entries.append(entry)
+    expected = expected_image_tokens if masked else 0
+    if not entries or any(x["masked_image_tokens"] != expected for x in entries):
+        raise RuntimeError(f"Unconfirmed image KV mask for {rid}; inspect {log_path}")
+    return {"masked_image_tokens": expected, "mask_draft_rounds": len(entries)}
 
 
 def post_stream(url, payload, timeout):
@@ -231,6 +261,16 @@ def parse_args():
     )
     parser.add_argument("--include-target-only", action="store_true")
     parser.add_argument(
+        "--image-kv-diagnostic",
+        action="store_true",
+        help="Compare baseline/nearest/image_mask with matched eager FlashInfer custom masks; not a speed benchmark",
+    )
+    parser.add_argument(
+        "--round-log",
+        action="store_true",
+        help="Log acceptance and image distance per Draft round; D2H copies perturb timing",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Separate diagnostic run; synchronizes CUDA and logs per-round phase timings",
@@ -288,12 +328,38 @@ def main():
         raise ValueError(
             "Extra server arguments override a required experiment setting"
         )
+    if args.image_kv_diagnostic:
+        controlled = {
+            "--speculative-draft-attention-backend",
+            "--speculative-draft-window-size",
+            "--disable-cuda-graph",
+            "--enable-dp-attention",
+            "--attn-dp-size",
+            "--dp-size",
+            "--tp",
+            "--tp-size",
+        }
+        if any(
+            x.split("=", 1)[0] in controlled
+            or x.startswith(
+                (
+                    "--cuda-graph-",
+                    "--disable-prefill-cuda-graph",
+                    "--disable-decode-cuda-graph",
+                )
+            )
+            for x in extra
+        ):
+            raise ValueError(
+                "Image diagnostic controls graph/backend and single-GPU settings"
+            )
     plans = []
     for name, image_shift, text_shift in arms(
         args.image_shift,
         args.text_shift,
         args.include_target_only,
         args.image_shift_sweep,
+        args.image_kv_diagnostic,
     ):
         command = [
             sys.executable,
@@ -318,6 +384,15 @@ def main():
                 "--speculative-draft-model-path",
                 args.draft,
             ]
+            if args.image_kv_diagnostic:
+                command += ["--speculative-draft-attention-backend", "flashinfer"]
+        if args.image_kv_diagnostic:
+            command += [
+                "--cuda-graph-backend-decode",
+                "disabled",
+                "--cuda-graph-backend-prefill",
+                "disabled",
+            ]
         plans.append(
             (
                 name,
@@ -341,6 +416,17 @@ def main():
         # environment cannot silently enable nearest placement in control runs.
         plans[-1][2]["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"] = str(
             int(image_shift == "nearest")
+        )
+        plans[-1][2].update(
+            {
+                "SGLANG_DFLASH_ROPE_DIAGNOSTIC": str(
+                    int(args.image_kv_diagnostic and name != "target_only")
+                ),
+                "SGLANG_DFLASH_IMAGE_KV_MASK": str(int(name == "image_mask")),
+                "SGLANG_DFLASH_ROPE_ROUND_LOG": str(
+                    int(args.round_log or args.image_kv_diagnostic)
+                ),
+            }
         )
     if args.dry_run:
         print(json.dumps(plans, indent=2))
@@ -505,6 +591,12 @@ def main():
                                     "id": sample["id"],
                                     "rid": rid,
                                     "profile": args.profile,
+                                    "image_kv_diagnostic": args.image_kv_diagnostic,
+                                    "round_log": args.round_log
+                                    or args.image_kv_diagnostic,
+                                    "timing_diagnostic_only": args.profile
+                                    or args.round_log
+                                    or args.image_kv_diagnostic,
                                     "requested_image_shift": overrides[ENV_KEYS[0]],
                                     "requested_text_shift": overrides[ENV_KEYS[1]],
                                     "image_shift_mode": "nearest"
@@ -540,7 +632,34 @@ def main():
                                     or int(overrides[ENV_KEYS[1]]) != 0
                                     or overrides["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"]
                                     == "1"
+                                    or (
+                                        args.image_kv_diagnostic
+                                        and name != "target_only"
+                                    )
                                 )
+                                row.update(
+                                    mask_summary(
+                                        log_path,
+                                        rid,
+                                        meta["image_tokens"],
+                                        name == "image_mask",
+                                    )
+                                    if args.image_kv_diagnostic
+                                    and name != "target_only"
+                                    else {
+                                        "masked_image_tokens": 0,
+                                        "mask_draft_rounds": None,
+                                    }
+                                )
+                                if (
+                                    args.image_kv_diagnostic
+                                    and name != "target_only"
+                                    and row["mask_draft_rounds"]
+                                    != meta["spec_verify_ct"]
+                                ):
+                                    raise RuntimeError(
+                                        f"Mask diagnostics do not cover every verification round for {rid}"
+                                    )
                                 row.update(
                                     shift_summary(log_path, rid)
                                     if intervention
@@ -573,6 +692,7 @@ def main():
             for marker, stem in (
                 ("DFLASH_PROMPT_ROPE ", "shifts"),
                 ("DFLASH_ROPE_ROUND ", "rounds"),
+                ("DFLASH_IMAGE_MASK ", "masks"),
             ):
                 with (args.output_dir / f"{stem}_{name}.jsonl").open("w") as extracted:
                     for line in (

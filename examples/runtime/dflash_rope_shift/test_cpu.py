@@ -29,6 +29,26 @@ runner = load_module(
 
 
 class PromptTranslationTests(unittest.TestCase):
+    def test_image_mask_keeps_text_generated_history_and_block(self):
+        visibility = shift_module.context_key_allow_mask
+        spans = [(2, 4), (7, 8)]
+        mask = visibility(10, 13, 4, spans, True)
+        self.assertEqual(len(mask), 17)
+        self.assertEqual(
+            [i for i, allowed in enumerate(mask) if not allowed], [2, 3, 4, 7, 8]
+        )
+        self.assertTrue(all(mask[10:]))
+        self.assertTrue(all(visibility(10, 13, 4, spans, False)))
+        # Same fixed prompt spans after another round; generated history stays visible.
+        later = visibility(10, 20, 4, spans, True)
+        self.assertEqual(later[:10], mask[:10])
+        self.assertTrue(all(later[10:]))
+        for prefix in [0, 9]:
+            with self.assertRaises(ValueError):
+                visibility(10, prefix, 4, spans, True)
+        with self.assertRaises(ValueError):
+            visibility(10, 13, 4, [(2, 7), (7, 8)], True)
+
     def test_nearest_is_fixed_and_preserves_visual_span(self):
         config = PromptRopeShift(image_nearest=True)
         self.assertTrue(config.enabled)
@@ -107,6 +127,35 @@ class PromptTranslationTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_mask_confirmation_checks_all_rounds_and_excludes_warmup(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            entries = [
+                {"rid": "case-warmup", "masked_image_tokens": 0},
+                {"rid": "case", "masked_image_tokens": 5},
+                {"rid": "case", "masked_image_tokens": 5},
+            ]
+
+            def write():
+                path.write_text(
+                    "\n".join("DFLASH_IMAGE_MASK " + json.dumps(x) for x in entries)
+                )
+
+            write()
+            self.assertEqual(
+                runner.mask_summary(path, "case", 5, True),
+                {"masked_image_tokens": 5, "mask_draft_rounds": 2},
+            )
+            with self.assertRaises(RuntimeError):
+                runner.mask_summary(path, "missing", 5, True)
+            entries[-1]["masked_image_tokens"] = 0
+            write()
+            with self.assertRaises(RuntimeError):
+                runner.mask_summary(path, "case", 5, True)
+
     def test_image_sweep_has_one_control_and_no_text_intervention(self):
         plans = runner.arms(
             128, 128, False, ["0", "128", "0128", "1024", "4096", "nearest"]
@@ -224,6 +273,31 @@ class StreamTests(unittest.TestCase):
                     self.assertEqual(
                         environment["SGLANG_DFLASH_PROMPT_IMAGE_SHIFT"], "4096"
                     )
+            diagnostic = json.loads(
+                subprocess.check_output(command + ["--image-kv-diagnostic"], text=True)
+            )
+            self.assertEqual(
+                [x[0] for x in diagnostic],
+                ["target_only", "baseline", "image_nearest", "image_mask"],
+            )
+            for name, argv, environment in diagnostic:
+                self.assertIn("--cuda-graph-backend-decode", argv)
+                self.assertIn("--cuda-graph-backend-prefill", argv)
+                self.assertEqual(
+                    environment["SGLANG_DFLASH_IMAGE_KV_MASK"],
+                    "1" if name == "image_mask" else "0",
+                )
+                self.assertEqual(
+                    environment["SGLANG_DFLASH_ROPE_DIAGNOSTIC"],
+                    "0" if name == "target_only" else "1",
+                )
+                self.assertEqual(environment["SGLANG_DFLASH_ROPE_ROUND_LOG"], "1")
+                self.assertEqual(
+                    "--speculative-draft-attention-backend" in argv,
+                    name != "target_only",
+                )
+            with self.assertRaises(ValueError):
+                runner.arms(128, 128, False, ["nearest"], True)
 
     def test_native_stream_keeps_final_cumulative_ids(self):
         import io

@@ -9,6 +9,23 @@ generated tokens use the same mapping. No query-relative re-rotation is needed.
 from dataclasses import dataclass
 
 
+def context_key_allow_mask(prompt_len, prefix_len, block_size, image_spans, mask_image):
+    """One visibility row; generated history and the whole draft block stay visible.
+
+    Used only by the eager, full-attention diagnostic. True means allowed;
+    repeating this row per query preserves the draft's noncausal block attention.
+    """
+    if not 0 < prompt_len <= prefix_len or block_size < 1:
+        raise ValueError("Invalid diagnostic prompt/prefix/block lengths")
+    # Reuse the position helper's validation, including overlapping spans.
+    PromptRopeShift().chunk_offsets(prompt_len, 0, 0, image_spans)
+    allow = [True] * (prefix_len + block_size)
+    if mask_image:
+        for lo, hi in image_spans:
+            allow[lo : hi + 1] = [False] * (hi - lo + 1)
+    return allow
+
+
 @dataclass(frozen=True)
 class PromptRopeShift:
     image_shift: int = 0

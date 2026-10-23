@@ -157,7 +157,8 @@ not a production cache-compatible feature.
   every request. `results.csv`: flat comparison after a successful matrix.
 * `server_<arm>.log`: startup and runtime logs, including shape/delta diagnostics.
 * `shifts_<arm>.jsonl`: measured-request mapping diagnostics (no warmup/health).
-* `rounds_<arm>.jsonl`: per-round diagnostics, populated only with `--profile`.
+* `rounds_<arm>.jsonl`: per-round diagnostics with `--profile`, `--round-log`,
+  or `--image-kv-diagnostic`.
 
 Acceptance length is SGLang's `completion_tokens / spec_verify_ct`, including
 bonus tokens and affected by final output truncation. Acceptance rate excludes
@@ -242,3 +243,81 @@ input first. The sweep uses deterministic decoding and one timing measurement
 per case; it is a mechanism probe, not a statistically established speedup or
 a held-out result. If a favorable offset emerges, freeze it and evaluate it on
 new images/questions before drawing a general conclusion.
+
+## Image KV dependence diagnostic
+
+Compare three Draft arms on exactly the same inputs:
+
+* `baseline`: original Key positions, all Context KV visible.
+* `image_nearest`: fixed nearest placement, all Context KV visible.
+* `image_mask`: original Key positions, image Context KV disallowed in attention.
+
+The mask is applied to Draft `DFlashVerifyInput.custom_mask` only. FlashInfer's
+paged prefill wrapper consumes it as a query-major boolean **allow** mask;
+False removes that Key from the softmax for every query and head. This is not
+zeroing K or V. Text, generated history, and all tokens of the noncausal Draft
+Block stay visible. Target prefill, Target verification, cache writes, physical
+KV slots and hidden-state capture are unchanged. Visual information may still
+flow through Target hidden states at text/generated positions, so this probes
+dependence on explicit visual Context KV, not all visual information.
+
+For matched execution, **all three arms** use FlashInfer Draft attention with
+custom masks (all-allow for the two controls), both CUDA graph phases disabled,
+single GPU, one request at a time, and no radix reuse. Unsupported compact,
+sliding-window or causal Draft configurations fail rather than run a different
+mask interpretation. This mode is a mechanism probe; its throughput is not
+comparable to earlier CUDA graph runs or evidence of a deployable speedup.
+
+```bash
+export CUDA_VISIBLE_DEVICES=6
+export NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="$NO_PROXY"
+
+python examples/runtime/dflash_rope_shift/run_matrix.py \
+  --model "$HOME/LMM/lmm_model/Qwen3.5-9B" \
+  --draft "$HOME/LMM/lmm_model/Qwen3.5-9B-DFlash" \
+  --samples smoke_rope/samples.jsonl \
+  --output-dir "smoke_rope/image_kv_diag_$(date +%Y%m%d_%H%M%S)" \
+  --port 31001 \
+  --image-kv-diagnostic \
+  --include-target-only \
+  --context-tokens 0 16384 \
+  --filler-file smoke_rope/neutral_context.txt \
+  --max-new-tokens 256 \
+  --server-args-json '["--mem-fraction-static","0.7"]'
+```
+
+Keep the CUDA 13 compatibility environment active. Start with the existing
+single image as a smoke check: this command produces **8 measured records**
+(4 arms x 2 lengths). Then replace the JSONL with 10–20 distinct image/question
+pairs emphasizing OCR, counting, charts and spatial relations. Each line has
+`id`, `image` and `question`; optional `answer` is preserved without automatic
+scoring. Sixteen thousand filler tokens test textual separation from the
+image, not long visual context. Short answers can terminate before 256 tokens;
+inspect actual completion lengths and early-round acceptance separately.
+
+`masks_<arm>.jsonl` confirms actual masked-Key counts on each Draft call.
+The runner requires the mask count to equal the response's image-token count
+in the masked arm (zero in controls), and requires coverage of every measured
+verification round. Warmup and readiness traffic are excluded from extracted
+files. CSV adds `masked_image_tokens`, `mask_draft_rounds`,
+`image_kv_diagnostic`, `round_log`, and `timing_diagnostic_only`.
+
+`rounds_<arm>.jsonl` includes request IDs, the first query's real position,
+generated-token count before that round, accepted Draft candidates (excluding
+bonus), committed tokens (including bonus), block size, and distance from the
+last translated visual Key. Counts describe the verification decision before
+scheduler EOS/output-budget truncation, so their sum can exceed the final
+completion count. In the masked arm the distance is geometric only: the visual
+Keys are not attended. Compare rounds at generated-token positions, not just
+round indices, since different acceptance changes block boundaries.
+
+`--round-log` can also be used on an ordinary shift sweep without timing events.
+It still copies small tensors from GPU to CPU and perturbs latency. CUDA phase
+times remain null unless `--profile` is also enabled. All three options mark
+timings as diagnostic-only; leave them off for subsequent speed measurements.
+
+Environment switches (runner resets them per arm):
+`SGLANG_DFLASH_ROPE_DIAGNOSTIC=1` selects matched custom-mask execution,
+`SGLANG_DFLASH_IMAGE_KV_MASK=1` additionally hides prompt image Keys,
+and `SGLANG_DFLASH_ROPE_ROUND_LOG=1` enables acceptance/distance logging.
