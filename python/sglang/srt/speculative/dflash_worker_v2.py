@@ -398,6 +398,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._prompt_rope_shift = PromptRopeShift(
             image_shift=envs.SGLANG_DFLASH_PROMPT_IMAGE_SHIFT.get(),
             image_nearest=envs.SGLANG_DFLASH_PROMPT_IMAGE_NEAREST.get(),
+            text_nearest=envs.SGLANG_DFLASH_PROMPT_TEXT_NEAREST.get(),
             text_shift=envs.SGLANG_DFLASH_PROMPT_TEXT_SHIFT.get(),
             text_keep_recent=envs.SGLANG_DFLASH_PROMPT_TEXT_KEEP_RECENT.get(),
         )
@@ -405,7 +406,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._rope_round_log = envs.SGLANG_DFLASH_ROPE_ROUND_LOG.get()
         self._rope_diagnostic = envs.SGLANG_DFLASH_ROPE_DIAGNOSTIC.get()
         self._image_kv_mask = envs.SGLANG_DFLASH_IMAGE_KV_MASK.get()
-        if self._image_kv_mask and not self._rope_diagnostic:
+        self._text_kv_mask = envs.SGLANG_DFLASH_TEXT_KV_MASK.get()
+        if (self._image_kv_mask or self._text_kv_mask) and not self._rope_diagnostic:
             raise ValueError(
                 "Image KV masking requires SGLANG_DFLASH_ROPE_DIAGNOSTIC=1"
             )
@@ -2807,6 +2809,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 block_size,
                 self._prompt_image_spans(req),
                 self._image_kv_mask,
+                self._text_kv_mask,
             )
             forward_batch.spec_info = replace(
                 self._draft_block_spec_info,
@@ -2815,13 +2818,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
             )
             if get_parallel().tp_rank == 0:
+                spans = self._prompt_image_spans(req)
+                visual_tokens = sum(hi - lo + 1 for lo, hi in spans)
                 logger.info(
                     "DFLASH_IMAGE_MASK %s",
                     json.dumps(
                         {
                             "rid": req.rid,
                             "query_position": prefix,
-                            "masked_image_tokens": len(allow) - sum(allow),
+                            "masked_image_tokens": visual_tokens
+                            if self._image_kv_mask
+                            else 0,
+                            "masked_text_tokens": len(req.origin_input_ids)
+                            - visual_tokens
+                            if self._text_kv_mask
+                            else 0,
+                            "masked_prompt_tokens": len(allow) - sum(allow),
                             "custom_mask_tokens": len(allow) * block_size,
                         }
                     ),
@@ -3163,6 +3175,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             prefixes = prefix_lens.cpu().tolist()
             accepted = accept_len.cpu().tolist()
             distances = []
+            text_distances = []
             for req, prefix in zip(batch.reqs, prefixes, strict=True):
                 _, info = self._prompt_rope_shift.chunk_offsets(
                     len(req.origin_input_ids), 0, 0, self._prompt_image_spans(req)
@@ -3172,6 +3185,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                     None
                     if distance is None
                     else distance + prefix - len(req.origin_input_ids)
+                )
+                text_distance = info["eligible_text_end_distance_after"]
+                text_distances.append(
+                    None
+                    if text_distance is None
+                    else text_distance + prefix - len(req.origin_input_ids)
                 )
             if get_parallel().tp_rank == 0:
                 logger.info(
@@ -3189,7 +3208,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                                 )
                             ],
                             "image_end_distances": distances,
+                            "eligible_text_end_distances": text_distances,
                             "image_kv_masked": self._image_kv_mask,
+                            "text_kv_masked": self._text_kv_mask,
                             "block_size": int(self.block_size),
                             "draft_ms": rope_events[0].elapsed_time(rope_events[1])
                             if rope_events

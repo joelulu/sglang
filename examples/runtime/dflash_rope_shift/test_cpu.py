@@ -29,6 +29,50 @@ runner = load_module(
 
 
 class PromptTranslationTests(unittest.TestCase):
+    def test_text_and_both_masks_cover_prompt_only(self):
+        spans = [(2, 4), (7, 8)]
+        for image, text in [(False, False), (True, False), (False, True), (True, True)]:
+            with self.subTest(image=image, text=text):
+                allow = shift_module.context_key_allow_mask(
+                    10, 13, 4, spans, image, text
+                )
+                self.assertTrue(all(allow[10:]))
+                self.assertEqual([allow[i] for i in [2, 3, 4, 7, 8]], [not image] * 5)
+                self.assertEqual([allow[i] for i in [0, 1, 5, 6, 9]], [not text] * 5)
+                self.assertEqual(allow.count(False), 5 * image + 5 * text)
+
+    def test_text_nearest_preserves_recent_suffix_and_internal_spacing(self):
+        config = PromptRopeShift(text_nearest=True, text_keep_recent=8)
+        spans = [(4, 23)]
+        full, info = config.chunk_offsets(100, 0, 110, spans)
+        self.assertTrue(config.enabled)
+        self.assertEqual(info["effective_text_shift"], 8)
+        self.assertEqual(info["eligible_text_end_distance_after"], 1)
+        self.assertEqual(full[92:], [0] * 18)
+        self.assertEqual(full[4:24], [0] * 20)
+        shifted_text = [p + full[p] for p in range(100) if p < 92 and not 4 <= p <= 23]
+        original_text = [p for p in range(92) if not 4 <= p <= 23]
+        self.assertEqual(shifted_text, [p + 8 for p in original_text])
+        chunks = []
+        for start, length in [(0, 10), (10, 90), (100, 10)]:
+            offsets, _ = config.chunk_offsets(100, start, length, spans)
+            chunks += offsets
+        self.assertEqual(full, chunks)
+        _, both = PromptRopeShift(
+            text_nearest=True, image_nearest=True, text_keep_recent=8
+        ).chunk_offsets(100, 0, 100, spans)
+        self.assertEqual(both["effective_text_shift"], 8)
+        self.assertEqual(both["effective_image_shift"], 76)
+        _, no_recent = PromptRopeShift(
+            text_nearest=True, text_keep_recent=0
+        ).chunk_offsets(100, 0, 100, spans)
+        self.assertEqual(no_recent["effective_text_shift"], 0)
+        _, no_text = PromptRopeShift(text_nearest=True).chunk_offsets(
+            10, 0, 10, [(0, 9)]
+        )
+        self.assertEqual(no_text["effective_text_shift"], 0)
+        self.assertIsNone(no_text["eligible_text_end_distance_after"])
+
     def test_image_mask_keeps_text_generated_history_and_block(self):
         visibility = shift_module.context_key_allow_mask
         spans = [(2, 4), (7, 8)]
@@ -221,7 +265,12 @@ class StreamTests(unittest.TestCase):
             write()
             self.assertEqual(
                 runner.mask_summary(path, "case", 5, True),
-                {"masked_image_tokens": 5, "mask_draft_rounds": 2},
+                {
+                    "masked_image_tokens": 5,
+                    "masked_text_tokens": 0,
+                    "masked_prompt_tokens": 5,
+                    "mask_draft_rounds": 2,
+                },
             )
             with self.assertRaises(RuntimeError):
                 runner.mask_summary(path, "missing", 5, True)
@@ -229,6 +278,53 @@ class StreamTests(unittest.TestCase):
             write()
             with self.assertRaises(RuntimeError):
                 runner.mask_summary(path, "case", 5, True)
+
+    def test_mask_confirmation_detects_text_mask_errors(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            for image, text in [
+                (False, False),
+                (True, False),
+                (False, True),
+                (True, True),
+            ]:
+                entry = {
+                    "rid": "case",
+                    "masked_image_tokens": 5 if image else 0,
+                    "masked_text_tokens": 7 if text else 0,
+                    "masked_prompt_tokens": 5 * image + 7 * text,
+                }
+                path.write_text("DFLASH_IMAGE_MASK " + json.dumps(entry))
+                info = runner.mask_summary(path, "case", 5, image, 7, text)
+                self.assertEqual(info["masked_prompt_tokens"], 5 * image + 7 * text)
+                entry["masked_text_tokens"] += 1
+                path.write_text("DFLASH_IMAGE_MASK " + json.dumps(entry))
+                with self.assertRaises(RuntimeError):
+                    runner.mask_summary(path, "case", 5, image, 7, text)
+
+    def test_baseline_comparison_uses_acceptance_and_verification_counts(self):
+        baseline = {"spec_accept_length": 2.0, "spec_verify_ct": 128}
+        row = {"spec_accept_length": 2.56, "spec_verify_ct": 100}
+        changes = runner.baseline_changes(row, baseline)
+        self.assertAlmostEqual(changes["spec_accept_length_change_pct"], 28)
+        self.assertEqual(changes["spec_verify_ct_change"], -28)
+        self.assertEqual(
+            runner.baseline_changes(baseline, baseline)[
+                "spec_accept_length_change_pct"
+            ],
+            0,
+        )
+        self.assertIsNone(
+            runner.baseline_changes(row, None)["spec_accept_length_change_pct"]
+        )
+        self.assertIsNone(
+            runner.baseline_changes({"spec_accept_length": None}, baseline)[
+                "spec_accept_length_change_pct"
+            ]
+        )
 
     def test_image_sweep_has_one_control_and_no_text_intervention(self):
         plans = runner.arms(
@@ -366,6 +462,48 @@ class StreamTests(unittest.TestCase):
                     "0" if name == "target_only" else "1",
                 )
                 self.assertEqual(environment["SGLANG_DFLASH_ROPE_ROUND_LOG"], "1")
+                self.assertEqual(
+                    "--speculative-draft-attention-backend" in argv,
+                    name != "target_only",
+                )
+            full = json.loads(
+                subprocess.check_output(
+                    command + ["--modality-kv-diagnostic"], text=True
+                )
+            )
+            self.assertEqual(
+                [plan[0] for plan in full],
+                [
+                    "target_only",
+                    "baseline",
+                    "image_nearest",
+                    "image_mask",
+                    "text_nearest",
+                    "text_mask",
+                    "both_nearest",
+                    "both_mask",
+                ],
+            )
+            for name, argv, environment in full:
+                self.assertEqual(
+                    environment["SGLANG_DFLASH_IMAGE_KV_MASK"],
+                    str(int(name in ("image_mask", "both_mask"))),
+                )
+                self.assertEqual(
+                    environment["SGLANG_DFLASH_TEXT_KV_MASK"],
+                    str(int(name in ("text_mask", "both_mask"))),
+                )
+                self.assertEqual(
+                    environment["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"],
+                    str(int(name in ("image_nearest", "both_nearest"))),
+                )
+                self.assertEqual(
+                    environment["SGLANG_DFLASH_PROMPT_TEXT_NEAREST"],
+                    str(int(name in ("text_nearest", "both_nearest"))),
+                )
+                self.assertEqual(environment["SGLANG_DFLASH_PROMPT_TEXT_SHIFT"], "0")
+                self.assertEqual(environment["SGLANG_DFLASH_PROMPT_IMAGE_SHIFT"], "0")
+                self.assertIn("--cuda-graph-backend-decode", argv)
                 self.assertEqual(
                     "--speculative-draft-attention-backend" in argv,
                     name != "target_only",

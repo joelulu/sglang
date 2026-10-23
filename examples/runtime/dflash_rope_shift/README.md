@@ -321,3 +321,91 @@ Environment switches (runner resets them per arm):
 `SGLANG_DFLASH_ROPE_DIAGNOSTIC=1` selects matched custom-mask execution,
 `SGLANG_DFLASH_IMAGE_KV_MASK=1` additionally hides prompt image Keys,
 and `SGLANG_DFLASH_ROPE_ROUND_LOG=1` enables acceptance/distance logging.
+
+## Image/text/both: six interventions against one baseline
+
+Use `--modality-kv-diagnostic` instead of `--image-kv-diagnostic` to run:
+
+| Arm | Prompt image KV | Prompt text KV |
+| --- | --- | --- |
+| `baseline` | Original positions, visible | Original positions, visible |
+| `image_nearest` | Fixed nearest translation | Unchanged |
+| `image_mask` | Hidden from Draft attention | Unchanged |
+| `text_nearest` | Unchanged | Fixed nearest translation of eligible older text |
+| `text_mask` | Unchanged | All prompt text hidden from Draft attention |
+| `both_nearest` | Image nearest translation | Text nearest translation |
+| `both_mask` | Hidden | All prompt text hidden |
+
+All seven Draft arms use the same eager FlashInfer custom-mask path. The old
+three-arm image diagnostic and fixed-translation sweep remain available.
+These two diagnostic flags are mutually exclusive and cannot be combined with
+`--image-shift-sweep`. Fixed `--image-shift`/`--text-shift` values are ignored
+by both diagnostic modes.
+
+**Text nearest semantics:** the eligible group excludes image spans and the
+last `--text-keep-recent` sequence positions of the prompt (default 256).
+Translate this group uniformly until its last Key is at `prompt_length - 1`.
+Text in that recent suffix is unchanged. Internal text distances are preserved;
+this is not compression. On a long textual suffix, the effective translation
+is typically only 256, even when the prompt is 32K long. With keep-recent=0,
+the group's last Key usually already occupies that position, so nearest can be
+a no-op. Inspect `effective_text_shift`, `eligible_text_tokens`, and
+`eligible_text_end_distance_before/after`. These endpoint distances describe
+the eligible older text, not the unchanged recent suffix. Translated groups
+may share RoPE coordinates with recent text or each other; real cache indices
+and attention visibility do not change.
+
+**Text masking semantics:** mask every original prompt position outside image
+spans, including special tokens, the question and recent prompt text. This
+deliberately does not apply the nearest shift's keep-recent exclusion. Image
+masking covers image spans. Both masking removes all prompt Context KV reads,
+but generated history and the current Draft Block remain visible. Thus
+`both_mask` is not a KV-free drafter, and visual/text information may still
+arrive through generated-position Target hidden states.
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python examples/runtime/dflash_rope_shift/run_matrix.py \
+  --model "$HOME/LMM/lmm_model/Qwen3.5-9B" \
+  --draft "$HOME/LMM/lmm_model/Qwen3.5-9B-DFlash" \
+  --samples smoke_rope/samples.jsonl \
+  --output-dir "smoke_rope/modality_diag_$(date +%Y%m%d_%H%M%S)" \
+  --port 31001 \
+  --modality-kv-diagnostic \
+  --include-target-only \
+  --context-tokens 0 1024 4096 8192 16384 32768 \
+  --text-keep-recent 256 \
+  --filler-file smoke_rope/neutral_context.txt \
+  --max-new-tokens 256 \
+  --server-args-json '["--mem-fraction-static","0.7"]'
+```
+
+Use the existing virtual environment/CUDA 13 compatibility setup and localhost
+proxy exclusions. This command uses physical GPU 7 only. One sample produces
+**48 measured records**: 7 Draft arms plus Target-only, times 6 context lengths.
+Without `--include-target-only`, it produces 42 records. Servers are started
+and stopped automatically, once per arm.
+
+CSV/JSONL adds `modality_kv_diagnostic`, `text_shift_mode`, `text_keep_recent`,
+`masked_text_tokens` and `masked_prompt_tokens`. Runtime validation checks image,
+text and total masked counts on every measured Draft call. The log marker
+remains `DFLASH_IMAGE_MASK` for compatibility; extracted `masks_*.jsonl` now
+contains both modalities. Round logs also include eligible-text endpoint
+distances and `text_kv_masked`.
+
+Per-case comparisons (same sample, context length, image size) are included in
+each measured row:
+
+* `baseline_spec_accept_length`: the matching baseline's acceptance length.
+* `spec_accept_length_change_pct`: `(arm / baseline - 1) * 100`; positive is better.
+* `spec_verify_ct_change`: `arm_verify - baseline_verify`; negative is fewer calls.
+
+Baseline changes are zero; Target-only changes are blank. These comparisons
+are not aggregated across samples and do not establish statistical significance.
+Always inspect `matches_baseline` and `matches_target` alongside acceptance.
+Known output mismatches in the exploratory image run still require investigation;
+this extension does not fix or waive the correctness check. A matrix saves
+results, then exits unsuccessfully if any output mismatch was found. Diagnostic
+timings remain unsuitable for claiming production speedups.
+
+Additional environment switches, explicitly reset per arm:
+`SGLANG_DFLASH_PROMPT_TEXT_NEAREST=1` and `SGLANG_DFLASH_TEXT_KV_MASK=1`.

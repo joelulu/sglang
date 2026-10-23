@@ -30,8 +30,9 @@ def arms(
     target_only,
     image_shift_sweep=None,
     image_kv_diagnostic=False,
+    modality_kv_diagnostic=False,
 ):
-    if image_kv_diagnostic:
+    if image_kv_diagnostic or modality_kv_diagnostic:
         if image_shift_sweep is not None:
             raise ValueError(
                 "Choose image KV diagnostic or image shift sweep, not both"
@@ -41,6 +42,13 @@ def arms(
             ("image_nearest", "nearest", 0),
             ("image_mask", 0, 0),
         ]
+        if modality_kv_diagnostic:
+            result += [
+                ("text_nearest", 0, "nearest"),
+                ("text_mask", 0, 0),
+                ("both_nearest", "nearest", "nearest"),
+                ("both_mask", 0, 0),
+            ]
     elif image_shift_sweep is None:
         result = [
             ("baseline", 0, 0),
@@ -81,6 +89,8 @@ def shift_summary(log_path, rid):
         "eligible_text_tokens",
         "image_end_distance_before",
         "image_end_distance_after",
+        "eligible_text_end_distance_before",
+        "eligible_text_end_distance_after",
     )
     summary = {key: chunks[0].get(key) for key in keys}
     if any(any(entry.get(key) != summary[key] for key in keys) for entry in chunks):
@@ -89,7 +99,14 @@ def shift_summary(log_path, rid):
     return summary
 
 
-def mask_summary(log_path, rid, expected_image_tokens, masked):
+def mask_summary(
+    log_path,
+    rid,
+    expected_image_tokens,
+    masked,
+    expected_text_tokens=0,
+    mask_text=False,
+):
     """Require runtime confirmation, including every measured Draft round."""
     entries = []
     for line in log_path.read_text().splitlines():
@@ -98,9 +115,39 @@ def mask_summary(log_path, rid, expected_image_tokens, masked):
             if entry.get("rid") == rid:
                 entries.append(entry)
     expected = expected_image_tokens if masked else 0
-    if not entries or any(x["masked_image_tokens"] != expected for x in entries):
+    expected_text = expected_text_tokens if mask_text else 0
+    if not entries or any(
+        x["masked_image_tokens"] != expected
+        or x.get("masked_text_tokens", 0) != expected_text
+        or x.get("masked_prompt_tokens", x["masked_image_tokens"])
+        != expected + expected_text
+        for x in entries
+    ):
         raise RuntimeError(f"Unconfirmed image KV mask for {rid}; inspect {log_path}")
-    return {"masked_image_tokens": expected, "mask_draft_rounds": len(entries)}
+    return {
+        "masked_image_tokens": expected,
+        "masked_text_tokens": expected_text,
+        "masked_prompt_tokens": expected + expected_text,
+        "mask_draft_rounds": len(entries),
+    }
+
+
+def baseline_changes(row, baseline):
+    """Acceptance comparisons require the same sample, context, and image size."""
+    if baseline is None or row.get("spec_accept_length") is None:
+        return {
+            "baseline_spec_accept_length": None,
+            "spec_accept_length_change_pct": None,
+            "spec_verify_ct_change": None,
+        }
+    value = baseline["spec_accept_length"]
+    return {
+        "baseline_spec_accept_length": value,
+        "spec_accept_length_change_pct": 100 * (row["spec_accept_length"] / value - 1)
+        if value
+        else None,
+        "spec_verify_ct_change": row["spec_verify_ct"] - baseline["spec_verify_ct"],
+    }
 
 
 def post_stream(url, payload, timeout):
@@ -260,10 +307,16 @@ def parse_args():
         help="0 keeps original image; other values resize longest edge",
     )
     parser.add_argument("--include-target-only", action="store_true")
-    parser.add_argument(
+    diagnostic_group = parser.add_mutually_exclusive_group()
+    diagnostic_group.add_argument(
         "--image-kv-diagnostic",
         action="store_true",
         help="Compare baseline/nearest/image_mask with matched eager FlashInfer custom masks; not a speed benchmark",
+    )
+    diagnostic_group.add_argument(
+        "--modality-kv-diagnostic",
+        action="store_true",
+        help="Baseline plus image/text/both nearest and masking (7 Draft arms), matched eager FlashInfer",
     )
     parser.add_argument(
         "--round-log",
@@ -299,6 +352,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    diagnostic = args.image_kv_diagnostic or args.modality_kv_diagnostic
     samples = load_samples(args.samples.resolve())
     extra = json.loads(args.server_args_json)
     if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
@@ -328,7 +382,7 @@ def main():
         raise ValueError(
             "Extra server arguments override a required experiment setting"
         )
-    if args.image_kv_diagnostic:
+    if diagnostic:
         controlled = {
             "--speculative-draft-attention-backend",
             "--speculative-draft-window-size",
@@ -360,6 +414,7 @@ def main():
         args.include_target_only,
         args.image_shift_sweep,
         args.image_kv_diagnostic,
+        args.modality_kv_diagnostic,
     ):
         command = [
             sys.executable,
@@ -384,9 +439,9 @@ def main():
                 "--speculative-draft-model-path",
                 args.draft,
             ]
-            if args.image_kv_diagnostic:
+            if diagnostic:
                 command += ["--speculative-draft-attention-backend", "flashinfer"]
-        if args.image_kv_diagnostic:
+        if diagnostic:
             command += [
                 "--cuda-graph-backend-decode",
                 "disabled",
@@ -404,7 +459,7 @@ def main():
                             str,
                             (
                                 0 if image_shift == "nearest" else image_shift,
-                                text_shift,
+                                0 if text_shift == "nearest" else text_shift,
                                 args.text_keep_recent,
                             ),
                         ),
@@ -420,12 +475,16 @@ def main():
         plans[-1][2].update(
             {
                 "SGLANG_DFLASH_ROPE_DIAGNOSTIC": str(
-                    int(args.image_kv_diagnostic and name != "target_only")
+                    int(diagnostic and name != "target_only")
                 ),
-                "SGLANG_DFLASH_IMAGE_KV_MASK": str(int(name == "image_mask")),
-                "SGLANG_DFLASH_ROPE_ROUND_LOG": str(
-                    int(args.round_log or args.image_kv_diagnostic)
+                "SGLANG_DFLASH_PROMPT_TEXT_NEAREST": str(int(text_shift == "nearest")),
+                "SGLANG_DFLASH_IMAGE_KV_MASK": str(
+                    int(name in ("image_mask", "both_mask"))
                 ),
+                "SGLANG_DFLASH_TEXT_KV_MASK": str(
+                    int(name in ("text_mask", "both_mask"))
+                ),
+                "SGLANG_DFLASH_ROPE_ROUND_LOG": str(int(args.round_log or diagnostic)),
             }
         )
     if args.dry_run:
@@ -464,6 +523,7 @@ def main():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", args.port))
     baselines = {}
+    baseline_metrics = {}
     targets = {}
     rows = []
     mismatch = False
@@ -592,17 +652,22 @@ def main():
                                     "rid": rid,
                                     "profile": args.profile,
                                     "image_kv_diagnostic": args.image_kv_diagnostic,
-                                    "round_log": args.round_log
-                                    or args.image_kv_diagnostic,
+                                    "modality_kv_diagnostic": args.modality_kv_diagnostic,
+                                    "round_log": args.round_log or diagnostic,
                                     "timing_diagnostic_only": args.profile
                                     or args.round_log
-                                    or args.image_kv_diagnostic,
+                                    or diagnostic,
                                     "requested_image_shift": overrides[ENV_KEYS[0]],
                                     "requested_text_shift": overrides[ENV_KEYS[1]],
                                     "image_shift_mode": "nearest"
                                     if overrides["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"]
                                     == "1"
                                     else "fixed",
+                                    "text_shift_mode": "nearest"
+                                    if overrides["SGLANG_DFLASH_PROMPT_TEXT_NEAREST"]
+                                    == "1"
+                                    else "fixed",
+                                    "text_keep_recent": args.text_keep_recent,
                                     "context_tokens_requested": count,
                                     "context_tokens_actual": actual_count,
                                     "image_max_edge": edge,
@@ -632,27 +697,29 @@ def main():
                                     or int(overrides[ENV_KEYS[1]]) != 0
                                     or overrides["SGLANG_DFLASH_PROMPT_IMAGE_NEAREST"]
                                     == "1"
-                                    or (
-                                        args.image_kv_diagnostic
-                                        and name != "target_only"
-                                    )
+                                    or overrides["SGLANG_DFLASH_PROMPT_TEXT_NEAREST"]
+                                    == "1"
+                                    or (diagnostic and name != "target_only")
                                 )
                                 row.update(
                                     mask_summary(
                                         log_path,
                                         rid,
                                         meta["image_tokens"],
-                                        name == "image_mask",
+                                        name in ("image_mask", "both_mask"),
+                                        meta["prompt_tokens"] - meta["image_tokens"],
+                                        name in ("text_mask", "both_mask"),
                                     )
-                                    if args.image_kv_diagnostic
-                                    and name != "target_only"
+                                    if diagnostic and name != "target_only"
                                     else {
                                         "masked_image_tokens": 0,
+                                        "masked_text_tokens": 0,
+                                        "masked_prompt_tokens": 0,
                                         "mask_draft_rounds": None,
                                     }
                                 )
                                 if (
-                                    args.image_kv_diagnostic
+                                    diagnostic
                                     and name != "target_only"
                                     and row["mask_draft_rounds"]
                                     != meta["spec_verify_ct"]
@@ -669,8 +736,15 @@ def main():
                                         "eligible_text_tokens": None,
                                         "image_end_distance_before": None,
                                         "image_end_distance_after": None,
+                                        "eligible_text_end_distance_before": None,
+                                        "eligible_text_end_distance_after": None,
                                         "changed_tokens": 0,
                                     }
+                                )
+                                if name == "baseline":
+                                    baseline_metrics[key] = row.copy()
+                                row.update(
+                                    baseline_changes(row, baseline_metrics.get(key))
                                 )
                                 rows.append(row)
                                 output.write(
