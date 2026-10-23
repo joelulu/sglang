@@ -477,3 +477,87 @@ You can summarize an existing CSV locally without model loading:
 ```bash
 python examples/runtime/dflash_rope_shift/summarize_results.py RUN/results.csv
 ```
+
+## Generated Target-feature history window experiment
+
+This experiment tests whether the recovery after masking the entire prompt
+needs a long generated Target-feature history, or just a few recent positions.
+It does not change RoPE, the Target, or the draft block. All arms use the same
+eager FlashInfer custom-mask path, with no prefix reuse and one request at a time.
+
+| Arm | Prompt image/text Context KV | Generated-history Context KV |
+| --- | --- | --- |
+| `baseline` | All visible | All visible |
+| `both_mask` | All masked | All visible |
+| `both_mask_gen1` | All masked | Last 1 position |
+| `both_mask_gen4` | All masked | Last 4 positions |
+| `both_mask_gen16` | All masked | Last 16 positions |
+
+For prompt length P and current draft prefix Q, the generated history is
+`[P, Q)`. A window N exposes only `[max(P, Q-N), Q)`. The complete current draft
+block `[Q, Q+block_size)` remains visible, including its known anchor token;
+it is excluded from the window count. Therefore even the optional window 0
+is not a draft without the current token's information. The first round has
+zero generated-history positions for every window. Early rounds retain
+`min(N, Q-P)` positions. All generated KV is still materialized and cached:
+this is an information-dependence experiment, not a memory-saving implementation.
+
+Run in the established `.venv-rope` environment with CUDA compatibility variables
+and localhost proxy exclusions active:
+
+```bash
+git pull --ff-only origin research/vlm-dflash-rope-shift
+python examples/runtime/dflash_rope_shift/test_cpu.py
+
+CUDA_VISIBLE_DEVICES=7 python examples/runtime/dflash_rope_shift/run_matrix.py \
+  --model "$HOME/LMM/lmm_model/Qwen3.5-9B" \
+  --draft "$HOME/LMM/lmm_model/Qwen3.5-9B-DFlash" \
+  --samples examples/runtime/dflash_rope_shift/textvqa_11.jsonl \
+  --output-dir "smoke_rope/generated_kv_diag_$(date +%Y%m%d_%H%M%S)" \
+  --port 31001 \
+  --generated-kv-diagnostic \
+  --generated-kv-windows 1 4 16 \
+  --context-tokens 0 1024 4096 8192 16384 32768 \
+  --filler-file smoke_rope/neutral_context.txt \
+  --max-new-tokens 256 --ignore-eos --allow-output-mismatch \
+  --server-args-json '["--mem-fraction-static","0.7"]'
+```
+
+This runs **330 formal measurements**: 11 questions on 6 images x 6 context
+lengths x 5 arms, each with a separate 8-token warmup that is not scored.
+The context lengths refer to unrelated filler after the image, not the full
+prompt length. There is no Target-only arm and output identity differences
+are recorded without failing the completed acceptance-only matrix.
+`--generated-kv-windows 0 1 4 16` optionally adds a sixth arm with no generated
+history; `--dry-run` prints plans without model loading or serving.
+
+Read `summary.csv` for pooled completion-tokens/verification acceptance versus
+baseline and `vs_both_mask_change_pct` versus the full generated-history control.
+Read `round_summary.csv` for accepted draft candidates per round in `first_round`
+and position ranges `0-31`, `32-63`, `64-127`, `128-255` (and `256+` if present).
+Ranges use the logged number of generated Target-feature positions before the
+round, not the round ordinal. `first_round` duplicates the first entry in `0-31`
+as a separate diagnostic; do not add those rows together. Raw round counts
+exclude the bonus from accepted candidates and can include a final over-cap
+verification block, so they are not capped output throughput or exact short-run
+measurements. Each stage reports contributing samples and rounds.
+
+`masks_*.jsonl` confirms the actual visible/masked generated-history count,
+the unchanged visible block count, and complete prompt masking each round.
+`results.csv` also reports min/max visible generated-history counts. The runner
+fails if a requested window or block visibility is not confirmed in every
+measured verification round. Baseline resets the window to -1 (all history),
+even if an environment variable was inherited from another experiment.
+
+Interpretation: if window 1 closely follows `both_mask`, one recent position is
+sufficient for recovery on these probes; if 4/16 improve over 1, recovery needs
+more history. A gap to full baseline can still come from inaccessible prompt
+features. These tests do not prove that visual information specifically is
+stored in the latest hidden state. The small, shared-image dataset and forced
+post-EOS continuation remain the same limitations as the previous probe.
+
+Rebuild stage summaries from a completed run without GPUs:
+
+```bash
+python examples/runtime/dflash_rope_shift/summarize_rounds.py RUN/results.csv
+```

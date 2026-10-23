@@ -29,9 +29,128 @@ runner = load_module(
 summary_module = load_module(
     "dflash_rope_summary_cpu_test", Path(__file__).with_name("summarize_results.py")
 )
+sys.modules["summarize_results"] = summary_module
+round_summary_module = load_module(
+    "dflash_round_summary_cpu_test", Path(__file__).with_name("summarize_rounds.py")
+)
 
 
 class PromptTranslationTests(unittest.TestCase):
+    def test_generated_windows_keep_only_recent_history_and_all_block_keys(self):
+        for history in [0, 1, 3, 16, 33]:
+            for window in [-1, 0, 1, 4, 16]:
+                with self.subTest(history=history, window=window):
+                    prefix = 10 + history
+                    allow = shift_module.context_key_allow_mask(
+                        10, prefix, 8, [(2, 6)], True, True, window
+                    )
+                    expected = history if window == -1 else min(history, window)
+                    self.assertEqual(allow[:10], [False] * 10)
+                    self.assertEqual(
+                        allow[10:prefix],
+                        [False] * (history - expected) + [True] * expected,
+                    )
+                    self.assertEqual(allow[prefix:], [True] * 8)
+        with self.assertRaises(ValueError):
+            shift_module.context_key_allow_mask(10, 15, 8, [], True, True, -2)
+
+    def test_generated_window_can_be_varied_without_changing_prompt_visibility(self):
+        full = shift_module.context_key_allow_mask(10, 40, 8, [(2, 6)], False, False)
+        recent = shift_module.context_key_allow_mask(
+            10, 40, 8, [(2, 6)], False, False, 4
+        )
+        self.assertTrue(all(full))
+        self.assertTrue(all(recent[:10]))
+        self.assertEqual(recent[10:36], [False] * 26)
+        self.assertTrue(all(recent[36:]))
+
+    def test_generated_mask_confirmation_checks_history_counts_and_block(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "log"
+            entries = []
+            for history in [0, 1, 8]:
+                entries.append(
+                    {
+                        "rid": "case",
+                        "query_position": 10 + history,
+                        "masked_image_tokens": 6,
+                        "masked_text_tokens": 4,
+                        "masked_prompt_tokens": 10,
+                        "generated_kv_keep_recent": 4,
+                        "generated_history_tokens": history,
+                        "visible_generated_tokens": min(history, 4),
+                        "masked_generated_tokens": max(history - 4, 0),
+                        "block_tokens": 8,
+                        "visible_block_tokens": 8,
+                    }
+                )
+
+            def write():
+                path.write_text(
+                    "\n".join("DFLASH_IMAGE_MASK " + json.dumps(e) for e in entries)
+                )
+
+            write()
+            result = runner.mask_summary(path, "case", 6, True, 4, True, 4)
+            self.assertEqual(result["visible_generated_tokens_max"], 4)
+            self.assertEqual(result["visible_generated_tokens_min"], 0)
+            for key in [
+                "visible_generated_tokens",
+                "masked_generated_tokens",
+                "visible_block_tokens",
+                "generated_kv_keep_recent",
+            ]:
+                saved = entries[-1][key]
+                entries[-1][key] += 1
+                write()
+                with self.assertRaises(RuntimeError):
+                    runner.mask_summary(path, "case", 6, True, 4, True, 4)
+                entries[-1][key] = saved
+
+    def test_round_summaries_group_by_position_and_ignore_warmup(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            entries = []
+            for rid, positions in [("case", [0, 1, 32, 65, 128]), ("warmup", [0])]:
+                for position in positions:
+                    entries.append(
+                        {
+                            "rids": [rid],
+                            "generated_tokens_before": [position],
+                            "accepted_draft_tokens": [0 if position == 0 else 3],
+                            "committed_tokens": [1 if position == 0 else 4],
+                        }
+                    )
+            (directory / "rounds_both_mask_gen1.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in entries)
+            )
+            rows = [
+                {
+                    "arm": "both_mask_gen1",
+                    "rid": "case",
+                    "spec_verify_ct": 5,
+                    "context_tokens_requested": 1024,
+                    "image_max_edge": 0,
+                }
+            ]
+            groups = {
+                r["stage_by_generated_position"]: r
+                for r in round_summary_module.summarize_rounds(rows, directory)
+            }
+            self.assertEqual(groups["first_round"]["accepted_draft_tokens_mean"], 0)
+            self.assertEqual(groups["0-31"]["rounds"], 2)
+            self.assertEqual(groups["0-31"]["accepted_draft_tokens_mean"], 1.5)
+            self.assertEqual(groups["32-63"]["rounds"], 1)
+            rows[0]["spec_verify_ct"] = 6
+            with self.assertRaises(ValueError):
+                round_summary_module.summarize_rounds(rows, directory)
+
     def test_text_and_both_masks_cover_prompt_only(self):
         spans = [(2, 4), (7, 8)]
         for image, text in [(False, False), (True, False), (False, True), (True, True)]:
@@ -222,6 +341,9 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(row["unique_image_hashes"], 1)
         self.assertEqual(row["pooled_accept_length"], 2)
         self.assertAlmostEqual(row["pooled_accept_length_change_pct"], 25)
+        self.assertEqual(row["both_mask_pooled_accept_length"], 2)
+        self.assertEqual(row["vs_both_mask_change_pct"], 0)
+        self.assertAlmostEqual(summaries["baseline"]["vs_both_mask_change_pct"], -20)
         self.assertAlmostEqual(
             row["paired_accept_change_mean_pct"], 100 * ((2 / 3 - 1) + (8 / 5 - 1)) / 2
         )
@@ -579,6 +701,53 @@ class StreamTests(unittest.TestCase):
                 )
             with self.assertRaises(ValueError):
                 runner.arms(128, 128, False, ["nearest"], True)
+            windows = json.loads(
+                subprocess.check_output(
+                    command + ["--generated-kv-diagnostic"], text=True
+                )
+            )
+            self.assertEqual(
+                [p[0] for p in windows],
+                [
+                    "target_only",
+                    "baseline",
+                    "both_mask",
+                    "both_mask_gen1",
+                    "both_mask_gen4",
+                    "both_mask_gen16",
+                ],
+            )
+            for name, argv, environment in windows:
+                self.assertEqual(
+                    environment["SGLANG_DFLASH_GENERATED_KV_KEEP_RECENT"],
+                    name.removeprefix("both_mask_gen")
+                    if name.startswith("both_mask_gen")
+                    else "-1",
+                )
+                for modality in ["IMAGE", "TEXT"]:
+                    self.assertEqual(
+                        environment[f"SGLANG_DFLASH_{modality}_KV_MASK"],
+                        str(int(name.startswith("both_mask"))),
+                    )
+                    self.assertEqual(
+                        environment[f"SGLANG_DFLASH_PROMPT_{modality}_NEAREST"], "0"
+                    )
+                self.assertIn("--cuda-graph-backend-decode", argv)
+            self.assertEqual(
+                [
+                    p[0]
+                    for p in runner.arms(0, 0, False, generated_kv_windows=[0, 1, 1])
+                ],
+                ["baseline", "both_mask", "both_mask_gen0", "both_mask_gen1"],
+            )
+            for kwargs in [
+                dict(generated_kv_windows=[-1]),
+                dict(generated_kv_windows=[]),
+                dict(generated_kv_windows=[1], image_kv_diagnostic=True),
+                dict(generated_kv_windows=[1], image_shift_sweep=["nearest"]),
+            ]:
+                with self.assertRaises(ValueError):
+                    runner.arms(0, 0, False, **kwargs)
 
     def test_native_stream_keeps_final_cumulative_ids(self):
         import io

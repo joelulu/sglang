@@ -10,15 +10,25 @@ from dataclasses import dataclass
 
 
 def context_key_allow_mask(
-    prompt_len, prefix_len, block_size, image_spans, mask_image, mask_text=False
+    prompt_len,
+    prefix_len,
+    block_size,
+    image_spans,
+    mask_image,
+    mask_text=False,
+    generated_keep_recent=-1,
 ):
-    """One visibility row; generated history and the whole draft block stay visible.
+    """One visibility row; optionally restrict generated Target-feature history.
 
     Used only by the eager, full-attention diagnostic. True means allowed;
     repeating this row per query preserves the draft's noncausal block attention.
+    -1 retains all generated history; N >= 0 retains its last N sequence positions.
+    The current draft block is always visible, including its anchor token.
     """
     if not 0 < prompt_len <= prefix_len or block_size < 1:
         raise ValueError("Invalid diagnostic prompt/prefix/block lengths")
+    if generated_keep_recent < -1:
+        raise ValueError("Generated KV window must be -1 (all) or nonnegative")
     # Reuse the position helper's validation, including overlapping spans.
     PromptRopeShift().chunk_offsets(prompt_len, 0, 0, image_spans)
     # Text masking includes special tokens outside image spans and the recent
@@ -28,6 +38,9 @@ def context_key_allow_mask(
     )
     for lo, hi in image_spans:
         allow[lo : hi + 1] = [not mask_image] * (hi - lo + 1)
+    if generated_keep_recent >= 0:
+        end = max(prompt_len, prefix_len - generated_keep_recent)
+        allow[prompt_len:end] = [False] * (end - prompt_len)
     return allow
 
 

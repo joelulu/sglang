@@ -31,8 +31,24 @@ def arms(
     image_shift_sweep=None,
     image_kv_diagnostic=False,
     modality_kv_diagnostic=False,
+    generated_kv_windows=None,
 ):
-    if image_kv_diagnostic or modality_kv_diagnostic:
+    if generated_kv_windows is not None:
+        if (
+            image_kv_diagnostic
+            or modality_kv_diagnostic
+            or image_shift_sweep is not None
+        ):
+            raise ValueError(
+                "Generated KV diagnostic cannot be combined with other sweeps"
+            )
+        if not generated_kv_windows or any(x < 0 for x in generated_kv_windows):
+            raise ValueError("Generated KV windows must be nonnegative")
+        result = [("baseline", 0, 0), ("both_mask", 0, 0)] + [
+            (f"both_mask_gen{window}", 0, 0)
+            for window in dict.fromkeys(generated_kv_windows)
+        ]
+    elif image_kv_diagnostic or modality_kv_diagnostic:
         if image_shift_sweep is not None:
             raise ValueError(
                 "Choose image KV diagnostic or image shift sweep, not both"
@@ -106,6 +122,7 @@ def mask_summary(
     masked,
     expected_text_tokens=0,
     mask_text=False,
+    generated_keep_recent=None,
 ):
     """Require runtime confirmation, including every measured Draft round."""
     entries = []
@@ -124,12 +141,46 @@ def mask_summary(
         for x in entries
     ):
         raise RuntimeError(f"Unconfirmed image KV mask for {rid}; inspect {log_path}")
-    return {
+    summary = {
         "masked_image_tokens": expected,
         "masked_text_tokens": expected_text,
         "masked_prompt_tokens": expected + expected_text,
         "mask_draft_rounds": len(entries),
     }
+    if generated_keep_recent is not None:
+        visible_counts = []
+        for entry in entries:
+            history = (
+                entry.get("query_position", -1)
+                - expected_image_tokens
+                - expected_text_tokens
+            )
+            visible = (
+                history
+                if generated_keep_recent == -1
+                else min(history, generated_keep_recent)
+            )
+            if (
+                history < 0
+                or entry.get("generated_kv_keep_recent") != generated_keep_recent
+                or entry.get("generated_history_tokens") != history
+                or entry.get("visible_generated_tokens") != visible
+                or entry.get("masked_generated_tokens") != history - visible
+                or entry.get("block_tokens", 0) < 1
+                or entry.get("visible_block_tokens") != entry.get("block_tokens")
+            ):
+                raise RuntimeError(
+                    f"Unconfirmed generated KV window for {rid}; inspect {log_path}"
+                )
+            visible_counts.append(visible)
+        summary.update(
+            {
+                "generated_kv_keep_recent": generated_keep_recent,
+                "visible_generated_tokens_min": min(visible_counts),
+                "visible_generated_tokens_max": max(visible_counts),
+            }
+        )
+    return summary
 
 
 def baseline_changes(row, baseline):
@@ -329,6 +380,17 @@ def parse_args():
         action="store_true",
         help="Baseline plus image/text/both nearest and masking (7 Draft arms), matched eager FlashInfer",
     )
+    diagnostic_group.add_argument(
+        "--generated-kv-diagnostic",
+        action="store_true",
+        help="Compare baseline, both_mask with all history, and both_mask with generated-history windows",
+    )
+    parser.add_argument(
+        "--generated-kv-windows",
+        nargs="+",
+        type=int,
+        help="Generated KV positions to retain (default: 1 4 16); 0 keeps only the current Draft block",
+    )
     parser.add_argument(
         "--round-log",
         action="store_true",
@@ -373,7 +435,18 @@ def parse_args():
 
 def main():
     args = parse_args()
-    diagnostic = args.image_kv_diagnostic or args.modality_kv_diagnostic
+    diagnostic = (
+        args.image_kv_diagnostic
+        or args.modality_kv_diagnostic
+        or args.generated_kv_diagnostic
+    )
+    if args.generated_kv_windows is not None and not args.generated_kv_diagnostic:
+        raise ValueError("--generated-kv-windows requires --generated-kv-diagnostic")
+    generated_windows = (
+        (args.generated_kv_windows or [1, 4, 16])
+        if args.generated_kv_diagnostic
+        else None
+    )
     samples = load_samples(args.samples.resolve())
     extra = json.loads(args.server_args_json)
     if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
@@ -436,6 +509,7 @@ def main():
         args.image_shift_sweep,
         args.image_kv_diagnostic,
         args.modality_kv_diagnostic,
+        generated_windows,
     ):
         command = [
             sys.executable,
@@ -500,11 +574,16 @@ def main():
                 ),
                 "SGLANG_DFLASH_PROMPT_TEXT_NEAREST": str(int(text_shift == "nearest")),
                 "SGLANG_DFLASH_IMAGE_KV_MASK": str(
-                    int(name in ("image_mask", "both_mask"))
+                    int(name == "image_mask" or name.startswith("both_mask"))
                 ),
                 "SGLANG_DFLASH_TEXT_KV_MASK": str(
-                    int(name in ("text_mask", "both_mask"))
+                    int(name == "text_mask" or name.startswith("both_mask"))
                 ),
+                "SGLANG_DFLASH_GENERATED_KV_KEEP_RECENT": name.removeprefix(
+                    "both_mask_gen"
+                )
+                if name.startswith("both_mask_gen")
+                else "-1",
                 "SGLANG_DFLASH_ROPE_ROUND_LOG": str(int(args.round_log or diagnostic)),
             }
         )
@@ -733,9 +812,14 @@ def main():
                                         log_path,
                                         rid,
                                         meta["image_tokens"],
-                                        name in ("image_mask", "both_mask"),
+                                        overrides["SGLANG_DFLASH_IMAGE_KV_MASK"] == "1",
                                         meta["prompt_tokens"] - meta["image_tokens"],
-                                        name in ("text_mask", "both_mask"),
+                                        overrides["SGLANG_DFLASH_TEXT_KV_MASK"] == "1",
+                                        int(
+                                            overrides[
+                                                "SGLANG_DFLASH_GENERATED_KV_KEEP_RECENT"
+                                            ]
+                                        ),
                                     )
                                     if diagnostic and name != "target_only"
                                     else {
@@ -743,6 +827,9 @@ def main():
                                         "masked_text_tokens": 0,
                                         "masked_prompt_tokens": 0,
                                         "mask_draft_rounds": None,
+                                        "generated_kv_keep_recent": -1,
+                                        "visible_generated_tokens_min": None,
+                                        "visible_generated_tokens_max": None,
                                     }
                                 )
                                 if (
@@ -815,6 +902,13 @@ def main():
     from summarize_results import summarize, write_summary
 
     write_summary(summarize(rows), args.output_dir / "summary.csv")
+    if diagnostic:
+        from summarize_rounds import summarize_rounds
+
+        write_summary(
+            summarize_rounds(rows, args.output_dir),
+            args.output_dir / "round_summary.csv",
+        )
     print(
         f"[done] {len(rows)} results saved to {args.output_dir / 'results.csv'}",
         flush=True,

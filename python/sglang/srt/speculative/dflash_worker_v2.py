@@ -407,9 +407,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._rope_diagnostic = envs.SGLANG_DFLASH_ROPE_DIAGNOSTIC.get()
         self._image_kv_mask = envs.SGLANG_DFLASH_IMAGE_KV_MASK.get()
         self._text_kv_mask = envs.SGLANG_DFLASH_TEXT_KV_MASK.get()
-        if (self._image_kv_mask or self._text_kv_mask) and not self._rope_diagnostic:
+        self._generated_kv_keep_recent = (
+            envs.SGLANG_DFLASH_GENERATED_KV_KEEP_RECENT.get()
+        )
+        if self._generated_kv_keep_recent < -1:
+            raise ValueError("Generated KV window must be -1 (all) or nonnegative")
+        if (
+            self._image_kv_mask
+            or self._text_kv_mask
+            or self._generated_kv_keep_recent >= 0
+        ) and not self._rope_diagnostic:
             raise ValueError(
-                "Image KV masking requires SGLANG_DFLASH_ROPE_DIAGNOSTIC=1"
+                "Context KV masking requires SGLANG_DFLASH_ROPE_DIAGNOSTIC=1"
             )
         if self._rope_profile or self._rope_round_log or self._rope_diagnostic:
             from sglang.srt.arg_groups.overrides import resolving_view
@@ -2810,6 +2819,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._prompt_image_spans(req),
                 self._image_kv_mask,
                 self._text_kv_mask,
+                self._generated_kv_keep_recent,
             )
             forward_batch.spec_info = replace(
                 self._draft_block_spec_info,
@@ -2833,7 +2843,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                             - visual_tokens
                             if self._text_kv_mask
                             else 0,
-                            "masked_prompt_tokens": len(allow) - sum(allow),
+                            "masked_prompt_tokens": len(req.origin_input_ids)
+                            - sum(allow[: len(req.origin_input_ids)]),
+                            "generated_kv_keep_recent": self._generated_kv_keep_recent,
+                            "generated_history_tokens": prefix
+                            - len(req.origin_input_ids),
+                            "visible_generated_tokens": sum(
+                                allow[len(req.origin_input_ids) : prefix]
+                            ),
+                            "masked_generated_tokens": prefix
+                            - len(req.origin_input_ids)
+                            - sum(allow[len(req.origin_input_ids) : prefix]),
+                            "block_tokens": block_size,
+                            "visible_block_tokens": sum(allow[prefix:]),
                             "custom_mask_tokens": len(allow) * block_size,
                         }
                     ),
@@ -3211,6 +3233,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                             "eligible_text_end_distances": text_distances,
                             "image_kv_masked": self._image_kv_mask,
                             "text_kv_masked": self._text_kv_mask,
+                            "generated_kv_keep_recent": self._generated_kv_keep_recent,
+                            "visible_generated_tokens": [
+                                prefix - len(req.origin_input_ids)
+                                if self._generated_kv_keep_recent == -1
+                                else min(
+                                    self._generated_kv_keep_recent,
+                                    prefix - len(req.origin_input_ids),
+                                )
+                                for req, prefix in zip(
+                                    batch.reqs, prefixes, strict=True
+                                )
+                            ],
                             "block_size": int(self.block_size),
                             "draft_ms": rope_events[0].elapsed_time(rope_events[1])
                             if rope_events

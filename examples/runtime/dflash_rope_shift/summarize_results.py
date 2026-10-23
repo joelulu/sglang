@@ -27,6 +27,7 @@ def summarize(rows):
         )
 
     baselines = {case(r): r for r in rows if r["arm"] == "baseline"}
+    full_generated = {case(r): r for r in rows if r["arm"] == "both_mask"}
     groups = defaultdict(list)
     seen = set()
     for row in rows:
@@ -55,6 +56,13 @@ def summarize(rows):
         base_rounds = sum(int(r["spec_verify_ct"]) for r in controls)
         pooled = sum(tokens) / sum(rounds)
         base_pooled = base_tokens / base_rounds
+        history_controls = [full_generated.get(case(r)) for r in group]
+        history_pooled = (
+            sum(int(r["completion_tokens"]) for r in history_controls)
+            / sum(int(r["spec_verify_ct"]) for r in history_controls)
+            if all(r is not None for r in history_controls)
+            else None
+        )
         changes = []
         for row, base in zip(group, controls, strict=True):
             value = int(row["completion_tokens"]) / int(row["spec_verify_ct"])
@@ -74,6 +82,10 @@ def summarize(rows):
                 "pooled_accept_length": pooled,
                 "baseline_pooled_accept_length": base_pooled,
                 "pooled_accept_length_change_pct": 100 * (pooled / base_pooled - 1),
+                "both_mask_pooled_accept_length": history_pooled,
+                "vs_both_mask_change_pct": 100 * (pooled / history_pooled - 1)
+                if history_pooled
+                else None,
                 "paired_accept_change_mean_pct": sum(changes) / len(changes),
                 "win_count": sum(x > 1e-9 for x in changes),
                 "tie_count": sum(abs(x) <= 1e-9 for x in changes),
