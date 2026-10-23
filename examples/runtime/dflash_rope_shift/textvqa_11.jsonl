@@ -1,0 +1,11 @@
+{"id":"textvqa_test_39602","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/6abb8ddf5bd0ac6d.jpg","prompt":"what brand of phone?","answer":""}
+{"id":"textvqa_test_39603","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/6abb8ddf5bd0ac6d.jpg","prompt":"what time does the sales meeting start?","answer":""}
+{"id":"textvqa_test_39604","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/a644c4c46d7c0b0f.jpg","prompt":"what is the website displayed on the phone?","answer":""}
+{"id":"textvqa_test_39605","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/a644c4c46d7c0b0f.jpg","prompt":"who makes the phone?","answer":""}
+{"id":"textvqa_test_39606","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/168850c40ad1897e.jpg","prompt":"what app is shown on the right p hone?","answer":""}
+{"id":"textvqa_test_39607","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/de39ea9f2ac0f665.jpg","prompt":"what is free on this page?","answer":""}
+{"id":"textvqa_test_39608","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/de39ea9f2ac0f665.jpg","prompt":"what website is this?","answer":""}
+{"id":"textvqa_test_39609","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/a0ac133813c8bbbf.jpg","prompt":"what is the website?","answer":""}
+{"id":"textvqa_test_39610","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/a0ac133813c8bbbf.jpg","prompt":"how many people have saved it?","answer":""}
+{"id":"textvqa_test_39611","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/16a7f9be49ef66ea.jpg","prompt":"what kind of graph is this?","answer":""}
+{"id":"textvqa_test_39612","image":"/home/jovyan/LMM/liyt/datasets/TextVQA/test_images/16a7f9be49ef66ea.jpg","prompt":"what computer program is being used?","answer":""}

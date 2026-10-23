@@ -1,11 +1,12 @@
+import json
 import logging
 import math
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -58,6 +59,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_rope_shift import (
+    PromptRopeShift,
+    context_key_allow_mask,
+)
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -390,6 +395,68 @@ class DFlashWorkerV2(BaseSpecWorker):
         super().__init__()
 
         self.server_args = server_args
+        self._prompt_rope_shift = PromptRopeShift(
+            image_shift=envs.SGLANG_DFLASH_PROMPT_IMAGE_SHIFT.get(),
+            image_nearest=envs.SGLANG_DFLASH_PROMPT_IMAGE_NEAREST.get(),
+            text_nearest=envs.SGLANG_DFLASH_PROMPT_TEXT_NEAREST.get(),
+            text_shift=envs.SGLANG_DFLASH_PROMPT_TEXT_SHIFT.get(),
+            text_keep_recent=envs.SGLANG_DFLASH_PROMPT_TEXT_KEEP_RECENT.get(),
+        )
+        self._rope_profile = envs.SGLANG_DFLASH_ROPE_PROFILE.get()
+        self._rope_round_log = envs.SGLANG_DFLASH_ROPE_ROUND_LOG.get()
+        self._rope_diagnostic = envs.SGLANG_DFLASH_ROPE_DIAGNOSTIC.get()
+        self._image_kv_mask = envs.SGLANG_DFLASH_IMAGE_KV_MASK.get()
+        self._text_kv_mask = envs.SGLANG_DFLASH_TEXT_KV_MASK.get()
+        self._generated_kv_keep_recent = (
+            envs.SGLANG_DFLASH_GENERATED_KV_KEEP_RECENT.get()
+        )
+        if self._generated_kv_keep_recent < -1:
+            raise ValueError("Generated KV window must be -1 (all) or nonnegative")
+        if (
+            self._image_kv_mask
+            or self._text_kv_mask
+            or self._generated_kv_keep_recent >= 0
+        ) and not self._rope_diagnostic:
+            raise ValueError(
+                "Context KV masking requires SGLANG_DFLASH_ROPE_DIAGNOSTIC=1"
+            )
+        if self._rope_profile or self._rope_round_log or self._rope_diagnostic:
+            from sglang.srt.arg_groups.overrides import resolving_view
+
+            if not resolving_view(server_args).disable_overlap_schedule:
+                raise ValueError(
+                    "DFlash RoPE diagnostics require --disable-overlap-schedule"
+                )
+            if self._rope_profile and torch.device(target_worker.device).type != "cuda":
+                raise ValueError("DFlash RoPE profiling requires CUDA events")
+        if self._rope_diagnostic:
+            graph = get_exec().graph.cuda_graph_config
+            if (
+                graph.decode.backend != Backend.DISABLED
+                or graph.prefill.backend != Backend.DISABLED
+            ):
+                raise ValueError(
+                    "DFlash image diagnostic requires both CUDA graph phases disabled"
+                )
+            if (
+                get_parallel().tp_size != 1
+                or get_parallel().attn_dp_enabled
+                or get_parallel().attn_cp_size != 1
+            ):
+                raise ValueError(
+                    "DFlash image diagnostic currently requires single-GPU execution"
+                )
+        if self._prompt_rope_shift.enabled or self._rope_diagnostic:
+            from sglang.srt.arg_groups.overrides import resolving_view
+
+            if not resolving_view(server_args).disable_radix_cache:
+                raise ValueError(
+                    "DFlash prompt RoPE shifts require --disable-radix-cache. "
+                    "Translated Draft KVs must not be reused across requests."
+                )
+            logger.warning(
+                "Experimental DFlash prompt RoPE shift: %s", self._prompt_rope_shift
+            )
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self._target_worker = target_worker
@@ -430,6 +497,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        if self._rope_diagnostic:
+            from sglang.srt.layers.radix_attention import AttentionType
+
+            if self.use_compact_draft_cache:
+                raise ValueError("Image diagnostic requires noncompact Draft KV")
+            for layer in self.draft_model.layers:
+                attn = layer.self_attn
+                if (
+                    attn.sliding_window_size != -1
+                    or attn.attn_type != AttentionType.ENCODER_ONLY
+                ):
+                    raise ValueError(
+                        "Image diagnostic supports full, noncausal DFlash Draft attention only"
+                    )
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -579,7 +660,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
+        self._use_fused_kv_materialize = (
+            is_cuda() or is_hip() or is_xpu()
+        ) and not envs.SGLANG_DFLASH_ROPE_FORCE_SEQUENTIAL_KV.get()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -673,12 +756,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_owns_attention),
         ):
             self._draft_worker.init_attention_backends()
+            self._validate_image_diagnostic_backend()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )
+
+    def _validate_image_diagnostic_backend(self):
+        # ModelRunner is built with deferred backend initialization. Inspect the
+        # live backend only after TpModelWorker.init_attention_backends creates it.
+        if self._rope_diagnostic:
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferAttnBackend,
+            )
+
+            if not isinstance(
+                self.draft_model_runner.attn_backend, FlashInferAttnBackend
+            ):
+                raise ValueError("Image diagnostic requires FlashInfer Draft attention")
 
     def init_cuda_graphs(self):
         with (
@@ -2321,6 +2418,53 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    @staticmethod
+    def _prompt_image_spans(req):
+        from sglang.srt.managers.schedule_batch import Modality
+
+        spans = []
+        mm = req.multimodal_inputs
+        if mm is not None:
+            for item in mm.mm_items:
+                if item.modality != Modality.IMAGE or not item.offsets:
+                    raise ValueError(
+                        "DFlash image experiment requires image-only multimodal inputs with offsets"
+                    )
+                spans.extend(item.offsets)
+        return spans
+
+    def _shift_prefill_context_positions(self, batch, positions):
+        """Change only the RoPE input, before fused/sequential KV paths split.
+
+        Use full request offsets rather than image token IDs: SGLang can hash
+        multimodal placeholders. Chunk boundaries are CPU scheduling metadata;
+        do not read GPU positions back or mutate the original position buffer.
+        """
+        if not self._prompt_rope_shift.enabled and not self._rope_diagnostic:
+            return positions
+
+        offsets = []
+        for req, start, length in zip(
+            batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
+        ):
+            spans = self._prompt_image_spans(req)
+            deltas, diagnostics = self._prompt_rope_shift.chunk_offsets(
+                len(req.origin_input_ids), start, length, spans
+            )
+            offsets.extend(deltas)
+            if get_parallel().tp_rank == 0:
+                logger.info(
+                    "DFLASH_PROMPT_ROPE %s",
+                    json.dumps({"rid": req.rid, **diagnostics}, sort_keys=True),
+                )
+        if len(offsets) != positions.numel():
+            raise ValueError(
+                "DFlash prompt RoPE offsets do not align with context positions"
+            )
+        return positions + torch.tensor(
+            offsets, dtype=positions.dtype, device=positions.device
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -2390,10 +2534,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             # The draft KV goes to the slots the target prefill just wrote.
+            context_rope_positions = self._shift_prefill_context_positions(
+                batch, positions
+            )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=self._draft_write_ids(kv_loc_plan),
-                positions=positions,
+                positions=context_rope_positions,
                 extend_lens=ctx_lens,
             )
 
@@ -2657,6 +2804,63 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         draft_plan.bind(forward_batch, draft_translator)
 
+        if self._rope_diagnostic:
+            # Draft-only spec_info: never attach this mask to Target verification.
+            # All diagnostic arms use CUSTOM mask mode, including an all-allow
+            # baseline, so the mask kernel path is controlled across arms.
+            if bs != 1:
+                raise ValueError("Image diagnostic requires --max-running-requests 1")
+            prefix = int(prefix_lens.item())
+            req = batch.reqs[0]
+            allow = context_key_allow_mask(
+                len(req.origin_input_ids),
+                prefix,
+                block_size,
+                self._prompt_image_spans(req),
+                self._image_kv_mask,
+                self._text_kv_mask,
+                self._generated_kv_keep_recent,
+            )
+            forward_batch.spec_info = replace(
+                self._draft_block_spec_info,
+                custom_mask=torch.tensor(allow, dtype=torch.bool, device=device).repeat(
+                    block_size
+                ),
+            )
+            if get_parallel().tp_rank == 0:
+                spans = self._prompt_image_spans(req)
+                visual_tokens = sum(hi - lo + 1 for lo, hi in spans)
+                logger.info(
+                    "DFLASH_IMAGE_MASK %s",
+                    json.dumps(
+                        {
+                            "rid": req.rid,
+                            "query_position": prefix,
+                            "masked_image_tokens": visual_tokens
+                            if self._image_kv_mask
+                            else 0,
+                            "masked_text_tokens": len(req.origin_input_ids)
+                            - visual_tokens
+                            if self._text_kv_mask
+                            else 0,
+                            "masked_prompt_tokens": len(req.origin_input_ids)
+                            - sum(allow[: len(req.origin_input_ids)]),
+                            "generated_kv_keep_recent": self._generated_kv_keep_recent,
+                            "generated_history_tokens": prefix
+                            - len(req.origin_input_ids),
+                            "visible_generated_tokens": sum(
+                                allow[len(req.origin_input_ids) : prefix]
+                            ),
+                            "masked_generated_tokens": prefix
+                            - len(req.origin_input_ids)
+                            - sum(allow[len(req.origin_input_ids) : prefix]),
+                            "block_tokens": block_size,
+                            "visible_block_tokens": sum(allow[prefix:]),
+                            "custom_mask_tokens": len(allow) * block_size,
+                        }
+                    ),
+                )
+
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
             if self._draft_sampler is not None:
@@ -2664,6 +2868,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._draft_sampler.stage_sampling_params(
                     bs=bs, sampling_info=batch.sampling_info
                 )
+
+        rope_events = None
+        if self._rope_profile:
+            rope_events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            rope_events[0].record()
 
         with (
             torch.inference_mode(),
@@ -2794,6 +3003,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        if rope_events is not None:
+            rope_events[1].record()
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2854,12 +3065,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        if rope_events is not None:
+            rope_events[2].record()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
+        if rope_events is not None:
+            rope_events[3].record()
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
@@ -2973,6 +3188,75 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+
+        if rope_events is not None or self._rope_round_log:
+            # Diagnostic runs only: synchronization and D2H perturb throughput.
+            if rope_events is not None:
+                rope_events[3].synchronize()
+            committed = commit_lens.cpu().tolist()
+            prefixes = prefix_lens.cpu().tolist()
+            accepted = accept_len.cpu().tolist()
+            distances = []
+            text_distances = []
+            for req, prefix in zip(batch.reqs, prefixes, strict=True):
+                _, info = self._prompt_rope_shift.chunk_offsets(
+                    len(req.origin_input_ids), 0, 0, self._prompt_image_spans(req)
+                )
+                distance = info["image_end_distance_after"]
+                distances.append(
+                    None
+                    if distance is None
+                    else distance + prefix - len(req.origin_input_ids)
+                )
+                text_distance = info["eligible_text_end_distance_after"]
+                text_distances.append(
+                    None
+                    if text_distance is None
+                    else text_distance + prefix - len(req.origin_input_ids)
+                )
+            if get_parallel().tp_rank == 0:
+                logger.info(
+                    "DFLASH_ROPE_ROUND %s",
+                    json.dumps(
+                        {
+                            "rids": [req.rid for req in batch.reqs],
+                            "committed_tokens": committed,
+                            "accepted_draft_tokens": accepted,
+                            "query_positions": prefixes,
+                            "generated_tokens_before": [
+                                prefix - len(req.origin_input_ids)
+                                for req, prefix in zip(
+                                    batch.reqs, prefixes, strict=True
+                                )
+                            ],
+                            "image_end_distances": distances,
+                            "eligible_text_end_distances": text_distances,
+                            "image_kv_masked": self._image_kv_mask,
+                            "text_kv_masked": self._text_kv_mask,
+                            "generated_kv_keep_recent": self._generated_kv_keep_recent,
+                            "visible_generated_tokens": [
+                                prefix - len(req.origin_input_ids)
+                                if self._generated_kv_keep_recent == -1
+                                else min(
+                                    self._generated_kv_keep_recent,
+                                    prefix - len(req.origin_input_ids),
+                                )
+                                for req, prefix in zip(
+                                    batch.reqs, prefixes, strict=True
+                                )
+                            ],
+                            "block_size": int(self.block_size),
+                            "draft_ms": rope_events[0].elapsed_time(rope_events[1])
+                            if rope_events
+                            else None,
+                            "verify_forward_ms": rope_events[2].elapsed_time(
+                                rope_events[3]
+                            )
+                            if rope_events
+                            else None,
+                        }
+                    ),
+                )
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,

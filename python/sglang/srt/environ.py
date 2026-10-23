@@ -1492,6 +1492,21 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Experimental prompt-only, fixed translations of Draft Context Key RoPE.
+    # Zero/zero leaves the original runtime path untouched. Requires no radix
+    # reuse; see examples/runtime/dflash_rope_shift/README.md.
+    SGLANG_DFLASH_PROMPT_IMAGE_SHIFT = EnvInt(0)
+    SGLANG_DFLASH_PROMPT_IMAGE_NEAREST = EnvBool(False)
+    SGLANG_DFLASH_PROMPT_TEXT_NEAREST = EnvBool(False)
+    SGLANG_DFLASH_PROMPT_TEXT_SHIFT = EnvInt(0)
+    SGLANG_DFLASH_PROMPT_TEXT_KEEP_RECENT = EnvInt(256)
+    SGLANG_DFLASH_ROPE_PROFILE = EnvBool(False)
+    SGLANG_DFLASH_ROPE_ROUND_LOG = EnvBool(False)
+    SGLANG_DFLASH_ROPE_DIAGNOSTIC = EnvBool(False)
+    SGLANG_DFLASH_IMAGE_KV_MASK = EnvBool(False)
+    SGLANG_DFLASH_TEXT_KV_MASK = EnvBool(False)
+    SGLANG_DFLASH_GENERATED_KV_KEEP_RECENT = EnvInt(-1)
+    SGLANG_DFLASH_ROPE_FORCE_SEQUENTIAL_KV = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
